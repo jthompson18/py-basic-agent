@@ -1,0 +1,10 @@
+[
+  {"customer_id":"C001","name":"Rosa Parks","segment":"SMB","signup_date":"2024-07-12","state":"CA"},
+  {"customer_id":"C002","name":"Alan Turing","segment":"Enterprise","signup_date":"2023-11-03","state":"WA"},
+  {"customer_id":"C003","name":"Ada Lovelace","segment":"SMB","signup_date":"2024-03-21","state":"NY"},
+  {"customer_id":"C004","name":"Grace Hopper","segment":"Mid-Market","signup_date":"2024-05-10","state":"TX"},
+  {"customer_id":"C005","name":"Katherine Johnson","segment":"Enterprise","signup_date":"2023-12-08","state":"VA"},
+  {"customer_id":"C006","name":"Barbara Liskov","segment":"SMB","signup_date":"2025-01-09","state":"MA"},
+  {"customer_id":"C007","name":"Tim Berners-Lee","segment":"Mid-Market","signup_date":"2024-09-14","state":"IL"},
+  {"customer_id":"C008","name":"Linus Torvalds","segment":"Enterprise","signup_date":"2023-10-30","state":"OR"}
+]
