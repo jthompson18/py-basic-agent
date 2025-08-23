@@ -33,6 +33,15 @@ def transform(df: pd.DataFrame, spec: Dict[str, Any]) -> pd.DataFrame:
         rest = [c for c in out.columns if c not in wanted]
         out = out[wanted + rest]
 
+    # limit rows
+    if "limit" in spec and spec["limit"] is not None:
+        try:
+            n = int(spec["limit"])
+            if n >= 0:
+                out = out.head(n)
+        except (TypeError, ValueError):
+            pass
+
     return out
 
 

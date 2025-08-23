@@ -19,3 +19,4 @@ psycopg[binary]==3.2.1
 pgvector==0.2.5
 
 rich==13.8.1
+prompt_toolkit==3.0.47
