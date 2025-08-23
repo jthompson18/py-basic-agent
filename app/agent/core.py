@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import re
 from typing import List, Callable, Optional
-from loguru import logger
 from .schemas import Message, StepResult, ToolCall
 from .config import settings
 from . import llm, tools
+from .mcp_client import mcp_manager
+
 
 try:
     from .memory import SimpleMemory
@@ -114,7 +115,22 @@ async def run_agent(task: str, emit: Optional[EmitFn] = None, verbose: bool = Fa
                 history.append(
                     Message(role="tool", content="ETL SUMMARY:\n" + etl_summary))
                 emit("summary", {"type": "etl", "text": etl_summary})
-
+            elif tool.tool == "mcp":
+                # Expect: {"tool":"mcp","input":{"tool":"name","arguments":{...}}}
+                tool_name = tool.input.get("tool")
+                arguments = tool.input.get("arguments", {})
+                if not tool_name:
+                    obs = "MCP ERROR: missing 'tool' in input"
+                else:
+                    try:
+                        # default server
+                        result = await mcp_manager.call(tool_name, arguments)
+                        obs = f"MCP RESULT ({tool_name}): {result}"
+                    except Exception as e:
+                        obs = f"MCP ERROR: {e}"
+                memory.add(obs)
+                history.append(Message(role="tool", content=obs))
+                continue
             else:
                 msg = f"(unknown tool {tool.tool})"
                 memory.add(msg)

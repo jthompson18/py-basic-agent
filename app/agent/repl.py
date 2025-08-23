@@ -8,6 +8,8 @@ import shlex
 import urllib.parse
 from typing import Dict
 
+from .mcp_client import mcp_manager, HAS_MCP
+
 from rich.console import Console
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
@@ -56,6 +58,15 @@ def _help_text() -> str:
   • [bold]rename:[/bold][white]old1->new1,old2->new2[/white]
       Rename fields/columns. Quote names with spaces or numeric keys:
       [white]rename:'1958'->y1958,'unit price'->price[/white]
+
+[green]/mcp add -n <name> -c "<command>" [--env KEY=VAL,KEY2=VAL][/]
+  Start an MCP stdio server and register it.
+  [green]/mcp list[/]                         — list connected MCP servers
+  [green]/mcp default <name>[/]               — set default server
+  [green]/mcp tools [<name>][/]               — list tools exposed by a server
+  [green]/mcp call <tool> '<json>'[/]         — call a tool on the default server
+  [green]/mcp call <name> <tool> '<json>'[/]  — call a tool on a specific server
+  [green]/mcp remove <name>[/]                — disconnect & remove a server
 
 [bold]Color legend (verbose on)[/]
   [bright_black]Step[/]           — agent loop step
@@ -143,6 +154,42 @@ def _parse_flag_line(flag_line: str) -> Dict[str, str | None]:
             i += 2
         elif tok == "-l" and i + 1 < len(tokens):
             out["l"] = tokens[i + 1]
+            i += 2
+        else:
+            i += 1
+    return out
+
+
+def _parse_env_csv(s: str | None) -> dict:
+    if not s:
+        return {}
+    out = {}
+    for pair in s.split(","):
+        if not pair.strip():
+            continue
+        if "=" not in pair:
+            continue
+        k, v = pair.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _parse_mcp_add_flags(rest: str) -> dict:
+    # /mcp add -n NAME -c "cmd ..." [--env K=V,K2=V]
+    import shlex
+    toks = shlex.split(rest)
+    out = {"n": None, "c": None, "env": None}
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t == "-n" and i + 1 < len(toks):
+            out["n"] = toks[i + 1]
+            i += 2
+        elif t == "-c" and i + 1 < len(toks):
+            out["c"] = toks[i + 1]
+            i += 2
+        elif t == "--env" and i + 1 < len(toks):
+            out["env"] = toks[i + 1]
             i += 2
         else:
             i += 1
@@ -369,5 +416,122 @@ def run_repl(verbose: bool = True) -> None:
             asyncio.run(_run_flagged_etl(
                 flags["p"], flags["t"], flags["l"], verbose))
             continue
+
+            # MCP commands
+    if s.startswith("/mcp "):
+        if not HAS_MCP:
+            console.print(
+                "[red]MCP client not installed.[/] Add [white]mcp>=0.1[/white] to requirements.txt and rebuild.")
+            return
+
+        args = s[len("/mcp "):].strip()
+        if args.startswith("add "):
+            flags = _parse_mcp_add_flags(args[len("add "):])
+            if not flags["n"] or not flags["c"]:
+                console.print(
+                    "[red]/mcp add -n <name> -c \"<command>\" [--env KEY=VAL,KEY2=VAL][/]")
+                return
+            envd = _parse_env_csv(flags["env"])
+            try:
+                asyncio.run(mcp_manager.add_stdio(
+                    flags["n"], flags["c"], envd))
+                console.print(
+                    f"[green]MCP server '{flags['n']}' connected.[/]")
+            except Exception as e:
+                console.print(
+                    f"[red]MCP add error:[/] {type(e).__name__}: {e}")
+            return
+
+        if args == "list":
+            names = mcp_manager.list_servers()
+            if not names:
+                console.print("[bright_black](no MCP servers)[/]")
+            else:
+                default = mcp_manager.default_name
+                for n in names:
+                    star = " *default*" if n == default else ""
+                    console.print(f"- {n}{star}")
+            return
+
+        if args.startswith("default "):
+            name = args.split(maxsplit=1)[1].strip()
+            try:
+                mcp_manager.set_default(name)
+                console.print(f"[green]Default MCP server set to[/] {name}")
+            except Exception as e:
+                console.print(f"[red]MCP default error:[/] {e}")
+            return
+
+        if args.startswith("tools"):
+            parts = args.split(maxsplit=1)
+            name = parts[1].strip() if len(parts) > 1 else None
+            try:
+                tools_list = asyncio.run(mcp_manager.list_tools(name))
+                if not tools_list:
+                    console.print("[bright_black](no tools reported)[/]")
+                else:
+                    for t in tools_list:
+                        nm = t.get("name", "?")
+                        desc = t.get("description", "")
+                        console.print(f"- [white]{nm}[/white] — {desc}")
+            except Exception as e:
+                console.print(f"[red]MCP tools error:[/] {e}")
+            return
+
+        if args.startswith("call "):
+            # /mcp call <tool> '<json>'   OR   /mcp call <name> <tool> '<json>'
+            try:
+                parts = shlex.split(args)  # reuse shlex
+            except Exception as e:
+                console.print(f"[red]Parse error:[/] {e}")
+                return
+
+            # parts e.g. ["call","server","tool","{...}"] or ["call","tool","{...}"]
+            parts = parts[1:]  # drop "call"
+            server = None
+            tool = None
+            payload = None
+            if len(parts) == 2:
+                tool, payload = parts
+            elif len(parts) >= 3:
+                server, tool, payload = parts[0], parts[1], " ".join(parts[2:])
+            else:
+                console.print(
+                    "[red]Usage:[/] /mcp call <tool> '{json}'  OR  /mcp call <server> <tool> '{json}'")
+                return
+            import json
+            try:
+                args_obj = json.loads(payload)
+            except Exception as e:
+                console.print(f"[red]Bad JSON:[/] {e}")
+                return
+            try:
+                res = asyncio.run(mcp_manager.call(tool, args_obj, server))
+                console.print("[green]MCP result:[/]")
+                console.print(res)
+            except Exception as e:
+                console.print(
+                    f"[red]MCP call error:[/] {type(e).__name__}: {e}")
+            return
+
+        if args.startswith("remove "):
+            name = args.split(maxsplit=1)[1].strip()
+            try:
+                asyncio.run(mcp_manager.remove(name))
+                console.print(f"[green]MCP server '{name}' removed.[/]")
+            except Exception as e:
+                console.print(f"[red]MCP remove error:[/] {e}")
+            return
+
+        console.print("""[yellow]Unknown MCP command.[/]
+            Try:
+            /mcp add -n <name> -c "<command>" [--env KEY=VAL,KEY2=VAL]
+            /mcp list
+            /mcp default <name>
+            /mcp tools [<name>]
+            /mcp call <tool> '{json}'
+            /mcp call <name> <tool> '{json}'
+            /mcp remove <name>""")
+        return
 
         _run_once(s, verbose)
