@@ -1,8 +1,8 @@
 # app/agent/llm.py
 import httpx
+import json
 from .config import settings
 
-# Keep this in sync with your tools (search/fetch/memory/etl)
 SYSTEM_PROMPT = """You are a research + data agent.
 
 TOOLS: Call ONE tool per step by replying ONLY with JSON inside a fenced block:
@@ -43,32 +43,41 @@ async def _chat_native(messages: list[dict], temperature: float | None) -> str:
         r = await client.post("/api/chat", json=payload)
         r.raise_for_status()
         data = r.json()
-        # Native responses usually include message.content
         if isinstance(data, dict):
             if "message" in data and isinstance(data["message"], dict):
                 if "content" in data["message"]:
                     return data["message"]["content"]
-            # Some builds return a top-level content/response
             return data.get("content") or data.get("response") or ""
         return ""
 
 
 async def chat(messages: list[dict], temperature: float | None = None) -> str:
-    """
-    Sends a chat to Ollama. Expects messages already include a system prompt.
-    Falls back from OpenAI-compatible to native Ollama if needed.
-    """
     try:
         return await _chat_v1(messages, temperature)
-    except Exception as e1:
-        try:
-            return await _chat_native(messages, temperature)
-        except Exception as e2:
-            raise RuntimeError(
-                f"Failed to reach Ollama at {settings.ollama_base_url}. "
-                f"Tried /v1/chat/completions and /api/chat. "
-                f"Errors: {type(e1).name}: {e1}; {type(e2).name}: {e2}. "
-                "Is Ollama running, and is OLLAMA_BASE_URL correct?"
-            )
+    except Exception:
+        return await _chat_native(messages, temperature)
 
-all = ["SYSTEM_PROMPT", "chat"]
+# ---- tiny helpers for summaries - ---
+
+
+async def summarize_text(text: str, purpose: str) -> str:
+    """Generic short summary (bulleted, <=6 bullets)."""
+    sys = {"role": "system",
+           "content": f"You are a concise assistant. Summarize for: {purpose}. Use 3-6 bullets."}
+    usr = {"role": "user", "content": text[:12000]}
+    try:
+        out = await chat([sys, usr], temperature=0.1)
+        return out.strip()
+    except Exception as e:
+        return f"(summary error: {e})"
+
+
+async def summarize_search(results: list[dict]) -> str:
+    # Turn results into a short JSON and summarize
+    payload = json.dumps(results, ensure_ascii=False)
+    return await summarize_text(payload, "explain what these search results contain and how they relate to the user query")
+
+
+async def summarize_etl(result_obj: dict) -> str:
+    payload = json.dumps(result_obj, ensure_ascii=False)
+    return await summarize_text(payload, "explain what ETL was performed, the key columns/row count, and where outputs were saved")

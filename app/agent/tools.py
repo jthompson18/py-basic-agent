@@ -1,20 +1,50 @@
 # app/agent/tools.py
 from __future__ import annotations
-from .etl import (
-    load_csv, load_json, transform,
-    save_csv, save_parquet, save_sqlite, profile
-)
-
 import os
 import re
 import httpx
 from bs4 import BeautifulSoup
 from readability import Document
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+
+import pandas as pd
+import urllib.parse
+
+from .etl import (
+    load_csv, load_json, transform,
+    save_csv, save_parquet, save_sqlite, profile
+)
 
 from .config import settings
 
 SERPER_URL = "https://google.serper.dev/search"
+
+
+def _is_url(p: str) -> bool:
+    try:
+        u = urllib.parse.urlparse(p)
+        return u.scheme in ("http", "https") and bool(u.netloc)
+    except Exception:
+        return False
+
+
+def _resolve_local_path(p: str) -> str:
+    # Pass through URLs
+    if _is_url(p):
+        return p
+    # Absolute path inside container
+    if os.path.isabs(p) and os.path.exists(p):
+        return p
+    # Try relative to /app/data (host ./data)
+    cand = os.path.join("/app/data", p)
+    if os.path.exists(cand):
+        return cand
+    # Try relative to /app
+    cand2 = os.path.join("/app", p)
+    if os.path.exists(cand2):
+        return cand2
+    return p  # let downstream raise if missing
+
 
 # ---------- Search ----------
 
@@ -111,43 +141,95 @@ async def memory_tool(op: str, **kwargs) -> Dict[str, Any]:
 # ---------- Basic ETL facade ----------
 
 
+def _resolve_local_path(p: str) -> str:
+    # Accept absolute paths if they exist in the container
+    if os.path.isabs(p) and os.path.exists(p):
+        return p
+    # Try relative to /app/data (mounted from ./data)
+    cand = os.path.join("/app/data", p)
+    if os.path.exists(cand):
+        return cand
+    # Try relative to /app (your code mount)
+    cand2 = os.path.join("/app", p)
+    if os.path.exists(cand2):
+        return cand2
+    # As-is: let pandas try (may raise FileNotFoundError)
+    return p
+
+
 async def etl_tool(op: str, **kwargs) -> Dict[str, Any]:
-    """
-    etl_tool("load_csv", path="./data/in.csv")
-    etl_tool("load_json", path="./data/in.json")
-    etl_tool("transform", path="./data/in.csv", spec={...}, save={...})
-    """
     if op == "load_csv":
-        df = load_csv(
-            kwargs["path"], **{k: v for k, v in kwargs.items() if k not in {"path"}})
-        return {"profile": profile(df)}
+        path = _resolve_local_path(kwargs["path"])
+        # pandas can read URL or local path transparently
+        df = load_csv(path, **{k: v for k, v in kwargs.items() if k != "path"})
+        return {"profile": profile(df), "path": path}
+
     if op == "load_json":
-        df = load_json(
-            kwargs["path"], **{k: v for k, v in kwargs.items() if k not in {"path"}})
-        return {"profile": profile(df)}
+        path = _resolve_local_path(kwargs["path"])
+        if _is_url(path):
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                r = await client.get(path, headers={"User-Agent": "Mozilla/5.0"})
+                r.raise_for_status()
+                data = r.json()
+            df = pd.json_normalize(data)
+        else:
+            df = load_json(
+                path, **{k: v for k, v in kwargs.items() if k != "path"})
+        return {"profile": profile(df), "path": path}
+
     if op == "transform":
-        # load from path or url
         if "path" in kwargs:
-            df = load_csv(kwargs["path"])
+            path = _resolve_local_path(kwargs["path"])
+            # choose loader by extension
+            ext = os.path.splitext(urllib.parse.urlparse(path).path.lower())[1]
+            if ext == ".csv":
+                df = load_csv(path)
+            elif ext == ".json":
+                if _is_url(path):
+                    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                        r = await client.get(path, headers={"User-Agent": "Mozilla/5.0"})
+                        r.raise_for_status()
+                        data = r.json()
+                    df = pd.json_normalize(data)
+                else:
+                    df = load_json(path)
+            else:
+                return {"error": f"Unsupported transform source extension: {ext}"}
         elif "url" in kwargs:
-            df = load_json(kwargs["url"])
+            url = kwargs["url"]
+            # backwards-compat if LLM emits url instead of path
+            ext = os.path.splitext(urllib.parse.urlparse(url).path.lower())[1]
+            if ext == ".csv":
+                df = load_csv(url)
+            elif ext == ".json":
+                async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                    r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                    r.raise_for_status()
+                    data = r.json()
+                df = pd.json_normalize(data)
+            else:
+                return {"error": f"Unsupported transform source extension: {ext}"}
         else:
             return {"error": "transform requires 'path' or 'url'."}
+
         df2 = transform(df, kwargs.get("spec", {}))
         out: Dict[str, Any] = {"profile": profile(df2)}
         if "save" in kwargs:
             save = kwargs["save"]
             fmt = save.get("format")
             if fmt == "csv":
-                out["saved_as"] = save_csv(df2, save["path"])
+                out["saved_as"] = save_csv(
+                    df2, _resolve_local_path(save["path"]))
             elif fmt == "parquet":
-                out["saved_as"] = save_parquet(df2, save["path"])
+                out["saved_as"] = save_parquet(
+                    df2, _resolve_local_path(save["path"]))
             elif fmt == "sqlite":
                 out["saved_as"] = save_sqlite(
-                    df2, save["sqlite_path"], save["table"])
+                    df2, _resolve_local_path(save["sqlite_path"]), save["table"])
             else:
                 out["saved_as"] = None
         return out
+
     return {"error": f"unknown op {op}"}
 
 __all__ = ["serper_search", "fetch_url", "memory_tool", "etl_tool"]

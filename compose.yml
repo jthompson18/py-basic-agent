@@ -41,6 +41,8 @@ services:
   app:
     build:
       context: ./app
+    stdin_open: true
+    tty: true
     env_file: .env
     environment: *app_env
     volumes:
@@ -52,7 +54,6 @@ services:
     depends_on:
       pgvector:
         condition: service_healthy
-    command: ["task","Who founded NVIDIA and when?"]
 
   # Optional: dockerized Ollama, only when you enable the profile
   # ollama:

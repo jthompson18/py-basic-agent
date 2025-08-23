@@ -13,4 +13,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY agent ./agent
 ENV PYTHONUNBUFFERED=1
 
+# Always start the agent; default subcommand = REPL
 ENTRYPOINT ["python","-m","agent"]
+CMD ["repl"]

@@ -17,3 +17,5 @@ sqlalchemy==2.0.35
 
 psycopg[binary]==3.2.1
 pgvector==0.2.5
+
+rich==13.8.1

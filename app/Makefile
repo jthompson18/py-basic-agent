@@ -1,6 +1,14 @@
 # Default: host Ollama + pgvector (both enabled by default in compose)
 run:
-\tdocker compose up --build
+	# REPL by default (thanks to CMD ["repl"])
+	docker compose run --rm app
+
+run-quiet:
+	docker compose run --rm app --no-verbose
+
+task:
+	# one-shot task still works
+	docker compose run --rm app -t "Who founded NVIDIA and when?"
 
 # Use dockerized Ollama instead of host
 run-docker-ollama:
@@ -9,6 +17,3 @@ run-docker-ollama:
 
 sh:
 \tdocker compose exec app bash
-
-test:
-\tdocker compose run --rm app pytest -q
