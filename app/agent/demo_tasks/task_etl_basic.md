@@ -1,0 +1,1 @@
+“Load `./data/county_population.csv`, filter to WA state, compute YoY growth, save parquet to `./data/wa_pop.parquet`, and report top 5 counties by growth.”

@@ -1,0 +1,13 @@
+date,region,product,units,price
+2025-01-01,West,Gizmo,10,19.99
+2025-01-02,West,Widget,4,24.50
+2025-01-03,East,Gizmo,8,19.99
+2025-01-04,West,Gadget,12,9.99
+2025-01-05,North,Widget,6,24.50
+2025-01-06,West,Widget,9,24.50
+2025-01-07,South,Gizmo,3,19.99
+2025-01-08,West,Gizmo,7,19.99
+2025-01-09,East,Gadget,15,9.99
+2025-01-10,West,Widget,11,24.50
+2025-01-11,West,Gadget,5,9.99
+2025-01-12,North,Gizmo,13,19.99

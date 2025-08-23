@@ -1,0 +1,81 @@
+
+x-app-env: &app_env
+  # Default to HOST ollama; change to http://ollama:11434 when using dockerized Ollama
+  OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+  MODEL: ${MODEL:-llama3.1:8b}
+  EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
+  SERPER_API_KEY: ${SERPER_API_KEY}
+  MAX_STEPS: ${MAX_STEPS:-8}
+  TEMPERATURE: ${TEMPERATURE:-0.2}
+  MEMORY_BACKEND: ${MEMORY_BACKEND:-pgvector}
+  SQLITE_PATH: ${SQLITE_PATH:-/app/.data/agent.db}  # kept for optional sqlite demos
+  PGHOST: ${PGHOST:-pgvector}
+  PGPORT: ${PGPORT:-5432}
+  PGUSER: ${PGUSER:-agent}
+  PGPASSWORD: ${PGPASSWORD:-agent}
+  PGDATABASE: ${PGDATABASE:-agentdb}
+
+services:
+  # Runs by default (no profile) so pgvector is available out-of-the-box
+  pgvector:
+    image: ankane/pgvector:latest
+    environment:
+      POSTGRES_USER: ${PGUSER:-agent}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-agent}
+      POSTGRES_DB: ${PGDATABASE:-agentdb}
+      # Optional: override if your embed model isn’t 768-d
+      EMBED_DIM: ${EMBED_DIM:-768}
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      # Use $$ to pass env vars to the container shell (not expanded by Compose)
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  # App runs by default and can reach host's Ollama (Mac & Linux)
+  app:
+    build:
+      context: ./app
+    env_file: .env
+    environment: *app_env
+    volumes:
+      - ./app:/app
+      - ./.data:/app/.data
+      - ./data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      pgvector:
+        condition: service_healthy
+    command: ["task","Who founded NVIDIA and when?"]
+
+  # Optional: dockerized Ollama, only when you enable the profile
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: ollama
+  #   profiles: ["ollama-docker"]
+  #   ports: ["11434:11434"]
+  #   volumes:
+  #     - ollama:/root/.ollama
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+  #     interval: 5s
+  #     timeout: 5s
+  #     retries: 20
+  #   entrypoint:
+  #     - /bin/sh
+  #     - -lc
+  #     - |
+  #       ollama serve & sleep 2
+  #       ollama pull ${MODEL:-llama3.1:8b}
+  #       ollama pull ${EMBED_MODEL:-nomic-embed-text}
+  #       tail -f /dev/null
+
+volumes:
+  pgdata:
+  # ollama:

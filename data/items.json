@@ -1,0 +1,5 @@
+[
+  {"sku":"A1","price":10.0,"qty":3,"region":"West"},
+  {"sku":"B2","price":12.5,"qty":2,"region":"East"},
+  {"sku":"C3","price":8.0,"qty":7,"region":"West"}
+]
