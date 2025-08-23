@@ -1,57 +1,75 @@
-from typing import Any, Dict
+# app/agent/etl.py
+from __future__ import annotations
+import os
+import json
+import sqlite3
 import pandas as pd
+from typing import Dict, Any, List
 
 
-def load_csv(path_or_url: str, **kwargs) -> pd.DataFrame:
-    return pd.read_csv(path_or_url, **kwargs)
+def load_csv(path: str, **read_csv_kwargs) -> pd.DataFrame:
+    if not str(path).startswith(("http://", "https://")) and not os.path.exists(path):
+        raise FileNotFoundError(path)
+    return pd.read_csv(path, **read_csv_kwargs)
 
 
-def load_json(path_or_url: str, **kwargs) -> pd.DataFrame:
-    return pd.read_json(path_or_url, **kwargs)
+def load_json(path: str, **kwargs) -> pd.DataFrame:
+    # local file path (URL handled in tools.py)
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return pd.json_normalize(data)
 
 
 def transform(df: pd.DataFrame, spec: Dict[str, Any]) -> pd.DataFrame:
     out = df.copy()
-    if cols := spec.get("select"):
-        out = out[cols]
-    if ren := spec.get("rename"):
-        out = out.rename(columns=ren)
-    if filt := spec.get("filter"):
-        # Very small DSL: {"col": "value"} equals filter, or {"expr":"colA > 10"}
-        if "expr" in filt:
-            out = out.query(filt["expr"])
-        else:
-            for k, v in filt.items():
-                out = out[out[k] == v]
-    if derives := spec.get("derive"):
-        # {"new_col":"colA * 1.1"} (pandas eval)
-        for k, expr in derives.items():
-            out[k] = out.eval(expr)
+
+    # rename mapping
+    if spec.get("rename"):
+        out = out.rename(columns=spec["rename"])
+
+    # select (reorder)
+    if spec.get("select"):
+        wanted = [c for c in spec["select"] if c in out.columns]
+        rest = [c for c in out.columns if c not in wanted]
+        out = out[wanted + rest]
+
     return out
 
 
-def save_csv(df: pd.DataFrame, path: str, **kwargs) -> str:
-    df.to_csv(path, index=False, **kwargs)
-    return path
-
-
-def save_parquet(df: pd.DataFrame, path: str, **kwargs) -> str:
-    df.to_parquet(path, index=False, **kwargs)
-    return path
-
-
-def save_sqlite(df: pd.DataFrame, sqlite_path: str, table: str, if_exists="replace") -> str:
-    from sqlalchemy import create_engine
-    eng = create_engine(f"sqlite:///{sqlite_path}")
-    df.to_sql(table, eng, if_exists=if_exists, index=False)
-    return f"sqlite:///{sqlite_path}#{table}"
-
-
-def profile(df: pd.DataFrame) -> dict:
+def profile(df: pd.DataFrame) -> Dict[str, Any]:
     return {
-        "rows": len(df),
+        "rows": int(df.shape[0]),
+        "cols": int(df.shape[1]),
         "columns": list(df.columns),
-        "dtypes": {c: str(t) for c, t in df.dtypes.items()},
-        "null_counts": {c: int(df[c].isna().sum()) for c in df.columns},
-        "sample": df.head(5).to_dict(orient="records"),
+        "dtypes": {k: str(v) for k, v in df.dtypes.to_dict().items()},
+        "null_counts": {c: int(df[c].isna().sum()) for c in df.columns[:50]},
+        "head": df.head(5).to_dict(orient="records"),
     }
+
+
+def save_csv(df: pd.DataFrame, path: str) -> str:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df.to_csv(path, index=False)
+    return path
+
+
+def save_parquet(df: pd.DataFrame, path: str) -> str:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df.to_parquet(path, index=False)
+    return path
+
+
+def save_sqlite(df: pd.DataFrame, sqlite_path: str, table: str) -> str:
+    os.makedirs(os.path.dirname(sqlite_path), exist_ok=True)
+    con = sqlite3.connect(sqlite_path)
+    try:
+        df.to_sql(table, con, if_exists="replace", index=False)
+    finally:
+        con.close()
+    return f"sqlite://{sqlite_path}#{table}"
+
+
+def save_json(df: pd.DataFrame, path: str) -> str:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df.to_json(path, orient="records", indent=2, force_ascii=False)
+    return path

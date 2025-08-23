@@ -27,7 +27,7 @@ services:
       EMBED_DIM: ${EMBED_DIM:-768}
     ports: ["5432:5432"]
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pg_data:/var/lib/postgresql/data
       - ./postgres/init:/docker-entrypoint-initdb.d
     healthcheck:
       # Use $$ to pass env vars to the container shell (not expanded by Compose)
@@ -47,8 +47,8 @@ services:
     environment: *app_env
     volumes:
       - ./app:/app
-      - ./.data:/app/.data
-      - ./data:/app/data
+      - ./data:/app/data:rw
+      - ./.data:/app/.data:rw
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -78,5 +78,5 @@ services:
   #       tail -f /dev/null
 
 volumes:
-  pgdata:
+  pg_data: {}
   # ollama:
