@@ -2,147 +2,243 @@ from __future__ import annotations
 
 import json
 import re
-from typing import List, Callable, Optional
+from typing import Callable
+
 from .schemas import Message, StepResult, ToolCall
 from .config import settings
 from . import llm, tools
-from .mcp_client import mcp_manager
-
-
-try:
-    from .memory import SimpleMemory
-except Exception:
-    try:
-        from .memory.scratchpad import SimpleMemory
-    except Exception:
-        from .memory.simple_memory import SimpleMemory
+from .memory import get_memory
 
 EmitFn = Callable[[str, dict | str], None]
 
+# --- JSON parsing helpers ----------------------------------------------------
 
-def _build_messages(history: List[Message], memory: SimpleMemory) -> List[dict]:
-    sys = Message(
-        role="system",
-        content=llm.SYSTEM_PROMPT + f"\n\nRecent notes:\n{memory.dump()}",
-    )
-    return [sys.model_dump()] + [m.model_dump() for m in history]
+# Match fenced JSON blocks like:
+# ```json
+# { ... }
+# ```
+_FENCE_RE = re.compile(
+    r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+
+
+def _json_candidates(text: str) -> list[str]:
+    """
+    Return possible JSON payloads from the model output.
+    1) All fenced ```json ... ``` blocks.
+    2) If none found, try the whole text as JSON (unfenced).
+    """
+    blocks = [m.group(1).strip() for m in _FENCE_RE.finditer(text)]
+    if blocks:
+        return blocks
+    t = text.strip()
+    if t.startswith("{") and t.endswith("}"):
+        return [t]
+    return []
+
+
+async def _build_messages_async(history: list, memory) -> list:
+    try:
+        recent = await memory.adump(20)
+    except Exception:
+        recent = ""
+    # NEW: trim recent notes if very long
+    if isinstance(recent, str) and len(recent) > 4000:
+        recent = recent[:4000] + " …(truncated)"
+    sys = llm.SYSTEM_PROMPT + \
+        (f"\n\nRecent notes:\n{recent}" if recent else "")
+    return [Message(role="system", content=sys), *history]
 
 
 def _try_parse_step(text: str) -> StepResult:
-    blocks = re.findall(r"```json\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
-    raw_json = blocks[-1] if blocks else None
-    if not raw_json:
-        return StepResult(type="final", final_answer=text, raw=text)
-    try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return StepResult(type="final", final_answer=text, raw=text)
-    if "final" in data:
-        return StepResult(type="final", final_answer=data["final"], raw=text)
-    if "tool" in data and "input" in data:
-        return StepResult(type="tool_call", tool_call=ToolCall(tool=data["tool"], input=data["input"]), raw=text)
+    """
+    Parse model reply into a tool call or final:
+      - Accepts both fenced and unfenced JSON.
+      - Prefers 'tool' calls; uses 'final' only if explicitly present.
+      - Falls back to treating the raw text as final if no JSON matches.
+    """
+    for js in _json_candidates(text):
+        try:
+            data = json.loads(js)
+        except Exception:
+            continue
+
+        if isinstance(data, dict) and "tool" in data:
+            tool = str(data.get("tool", "")).strip()
+            tool_input = data.get("input") or {}
+            if not isinstance(tool_input, dict):
+                tool_input = {}
+            return StepResult(
+                type="tool_call",
+                tool_call=ToolCall(tool=tool, input=tool_input),
+                raw=text,
+            )
+
+        if isinstance(data, dict) and "final" in data:
+            return StepResult(
+                type="final",
+                final_answer=str(data.get("final", "")),
+                raw=text,
+            )
+
+    # No usable JSON -> treat as final raw text (so you can see what happened)
     return StepResult(type="final", final_answer=text, raw=text)
 
 
-async def run_agent(task: str, emit: Optional[EmitFn] = None, verbose: bool = False) -> str:
-    if emit is None:
-        emit = lambda *_args, **_kwargs: None
-
-    memory = SimpleMemory()
-    history: List[Message] = [Message(role="user", content=task)]
+async def run_agent(task: str, emit: EmitFn | None = None, verbose: bool = True) -> str:
+    """
+    Simple looped agent:
+      1) Ask the LLM what to do (tool call or final).
+      2) Run the tool (search/fetch/memory[/etl]).
+      3) Record obs in memory, optionally summarize, feed back to the model.
+      4) Repeat up to settings.max_steps or until final.
+    """
+    memory = get_memory()
+    history: list[Message] = [Message(role="user", content=task)]
 
     for step in range(settings.max_steps):
-        emit("step", {"n": step + 1, "max": settings.max_steps})
-        content = await llm.chat(_build_messages(history, memory))
-        if verbose:
+        if emit:
+            emit("step", {"n": step + 1, "max": settings.max_steps})
+
+        # 1) Ask the model
+        msgs = await _build_messages_async(history, memory)
+        content = await llm.chat(msgs)
+
+        if emit:
             emit("model", content)
+
         parsed = _try_parse_step(content)
 
+        # Final?
         if parsed.type == "final":
-            emit("final", parsed.final_answer or "(no answer)")
-            return parsed.final_answer or "(no answer)"
+            final = parsed.final_answer or "(no answer)"
+            if emit:
+                emit("final", final)
+            return final
 
-        tool = parsed.tool_call
-        assert tool is not None
+        # 2) Tool call?
+        if parsed.type == "tool_call":
+            tool = parsed.tool_call
+            if emit:
+                emit("tool_call", {"tool": tool.tool, "input": tool.input})
 
-        emit("tool_call", {"tool": tool.tool, "input": tool.input})
-        try:
-            if tool.tool == "search":
-                query = tool.input.get("query", "")
-                results = await tools.serper_search(query)
-                obs = "SEARCH RESULTS:\n" + \
-                    "\n".join(f"- {r['title']} — {r['url']}" for r in results)
-                memory.add(obs)
-                history.append(Message(role="tool", content=obs))
+            try:
+                # ---- search (Serper) ----
+                if tool.tool == "search":
+                    query = (tool.input or {}).get("query", "").strip()
+                    results = await tools.serper_search(query)
 
-                # Summarize search results
-                summary = await llm.summarize_search(results)
-                memory.add("SEARCH SUMMARY:\n" + summary)
-                history.append(
-                    Message(role="tool", content="SEARCH SUMMARY:\n" + summary))
-                emit("summary", {"type": "search", "text": summary})
-                emit("tool_result", {"tool": "search", "preview": obs})
+                    # Log & emit preview
+                    obs = "SEARCH RESULTS:\n" + "\n".join(
+                        f"- {r.get('title', '?')} — {r.get('url', '?')}" for r in results
+                    )
+                    await memory.aadd(obs, source="search", uri=f"serper:{query}")
+                    if emit:
+                        emit("tool_result", {"tool": "search", "preview": obs})
 
-            elif tool.tool == "fetch":
-                url = tool.input.get("url", "")
-                page = await tools.fetch_url(url)
-                obs = f"FETCHED: {page['title']} — {page['url']}\n\n{page['text'][:1500]}"
-                memory.add(obs)
-                history.append(Message(role="tool", content=obs))
-                emit("tool_result", {"tool": "fetch", "preview": obs})
-
-            elif tool.tool == "memory":
-                op = tool.input.get("op")
-                args = {k: v for k, v in tool.input.items() if k != "op"}
-                res = await tools.memory_tool(op, **args)
-                obs = f"MEMORY {op.upper()} RESULT:\n{json.dumps(res)[:1200]}"
-                memory.add(obs)
-                history.append(Message(role="tool", content=obs))
-                emit("tool_result", {"tool": f"memory:{op}", "preview": obs})
-
-            elif tool.tool == "etl":
-                op = tool.input.get("op")
-                args = {k: v for k, v in tool.input.items() if k != "op"}
-                res = await tools.etl_tool(op, **args)
-                obs = f"ETL {op.upper()} RESULT:\n{json.dumps(res)[:1200]}"
-                memory.add(obs)
-                history.append(Message(role="tool", content=obs))
-                emit("tool_result", {"tool": f"etl:{op}", "preview": obs})
-
-                # LLM ETL summary
-                etl_summary = await llm.summarize_etl(res)
-                memory.add("ETL SUMMARY:\n" + etl_summary)
-                history.append(
-                    Message(role="tool", content="ETL SUMMARY:\n" + etl_summary))
-                emit("summary", {"type": "etl", "text": etl_summary})
-            elif tool.tool == "mcp":
-                # Expect: {"tool":"mcp","input":{"tool":"name","arguments":{...}}}
-                tool_name = tool.input.get("tool")
-                arguments = tool.input.get("arguments", {})
-                if not tool_name:
-                    obs = "MCP ERROR: missing 'tool' in input"
-                else:
+                    # Optional LLM summary of search results
                     try:
-                        # default server
-                        result = await mcp_manager.call(tool_name, arguments)
-                        obs = f"MCP RESULT ({tool_name}): {result}"
-                    except Exception as e:
-                        obs = f"MCP ERROR: {e}"
-                memory.add(obs)
-                history.append(Message(role="tool", content=obs))
+                        summary = await llm.summarize_search(results)
+                        if emit:
+                            emit("summary", {
+                                 "type": "search", "text": summary})
+                        history.append(
+                            Message(role="assistant",
+                                    content=f"{obs}\n\nSummary:\n{summary}")
+                        )
+                    except Exception:
+                        history.append(Message(role="assistant", content=obs))
+
+                    continue
+
+                # ---- fetch (page fetch + readable text) ----
+                if tool.tool == "fetch":
+                    url = (tool.input or {}).get("url", "").strip()
+                    # expected keys: title, url, text
+                    page = await tools.fetch_url(url)
+                    title = page.get("title") or ""
+                    text = page.get("text") or ""
+                    preview = (text[:1000] + ("…" if len(text) > 1000 else ""))
+
+                    obs = f"FETCHED PAGE:\nTitle: {title}\nURL: {url}\n\n{preview}"
+                    await memory.aadd(
+                        f"Fetched {url} — {title}", source="fetch", uri=url, meta={"title": title}
+                    )
+                    if emit:
+                        emit("tool_result", {
+                             "tool": "fetch", "preview": f"{title} ({len(text)} chars)"})
+
+                    history.append(Message(role="assistant", content=obs))
+                    continue
+
+                # ---- memory (optional: allow LLM-driven memory ops) ----
+                if tool.tool == "memory":
+                    op = (tool.input or {}).get("op")
+                    if op == "remember":
+                        docs = (tool.input or {}).get("docs", [])
+                        count = await memory.aupsert(docs)
+                        obs = f"MEMORY: stored {count} document(s)."
+                    elif op == "recall":
+                        q = (tool.input or {}).get("query", "")
+                        k = int((tool.input or {}).get("k", 3))
+                        hits = await memory.aquery(q, k=k)
+                        lines = [
+                            f"- {h.get('source')}:{h.get('uri')} — {(h.get('content') or '')[:160]}"
+                            for h in hits
+                        ]
+                        obs = "MEMORY RECALL:\n" + \
+                            ("\n".join(lines) if lines else "(no hits)")
+                    else:
+                        obs = "MEMORY: unknown op."
+
+                    if emit:
+                        emit("tool_result", {"tool": "memory", "preview": obs})
+                    history.append(Message(role="assistant", content=obs))
+                    continue
+
+                # ---- etl (if your prompts call it directly) ----
+                if tool.tool == "etl":
+                    # Expect the LLM to pass through the kwargs your tools.etl_tool("transform", ...) expects.
+                    spec = tool.input or {}
+                    tr = await tools.etl_tool("transform", **spec)
+                    obs = f"ETL DONE: {str(tr)[:400]}"
+                    if emit:
+                        emit("tool_result", {"tool": "etl", "preview": obs})
+                    # Optional ETL summary
+                    try:
+                        summary = await llm.summarize_etl(tr)
+                        if emit:
+                            emit("summary", {"type": "etl", "text": summary})
+                        history.append(
+                            Message(role="assistant",
+                                    content=f"{obs}\n\nSummary:\n{summary}")
+                        )
+                    except Exception:
+                        history.append(Message(role="assistant", content=obs))
+                    continue
+
+                # Unknown tool
+                err = f"Unknown tool '{tool.tool}'"
+                await memory.aadd(err, source="error")
+                if emit:
+                    emit("error", err)
+                history.append(Message(role="assistant", content=err))
                 continue
-            else:
-                msg = f"(unknown tool {tool.tool})"
-                memory.add(msg)
-                history.append(Message(role="tool", content=msg))
-                emit("error", msg)
 
-        except Exception as e:
-            err = f"TOOL ERROR for {tool.tool}: {type(e).__name__}: {e}"
-            memory.add(err)
-            history.append(Message(role="tool", content=err))
-            emit("error", err)
+            except Exception as e:
+                # 3) Tool error handling: persist error & inform loop
+                err = f"TOOL ERROR for {tool.tool}: {type(e).__name__}: {e}"
+                await memory.aadd(err, source="error")
+                if emit:
+                    emit("error", err)
+                history.append(Message(role="assistant", content=err))
+                continue
 
-    out = "Reached max steps without final answer."
-    emit("final", out)
-    return out
+    # 4) Out of steps
+    fallback = "I couldn't complete within the step limit."
+    if emit:
+        try:
+            snapshot = await memory.adump(20)
+            emit("final", snapshot or fallback)
+        except Exception:
+            emit("final", fallback)
+    return fallback

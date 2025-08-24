@@ -11,7 +11,6 @@ class Settings(BaseModel):
     max_steps: int = int(os.getenv("MAX_STEPS", "8"))
     temperature: float = float(os.getenv("TEMPERATURE", "0.2"))
     memory_backend: str = os.getenv("MEMORY_BACKEND", "pgvector")
-    sqlite_path: str = os.getenv("SQLITE_PATH", "/app/.data/agent.db")
     # pg
     pghost: str = os.getenv("PGHOST", "pgvector")
     pgport: int = int(os.getenv("PGPORT", "5432"))

@@ -1,8 +1,18 @@
-# app/agent/memory/__init__.py
+from __future__ import annotations
+import os
 
+from .types import Memory
 from .simple_memory import SimpleMemory
 
-from .pg_store import PgVectorMemory
-from .sqlite_store import SqliteVectorMemory
 
-__all__ = ["SimpleMemory"]  # add store class names here if you re-export them
+def get_memory() -> Memory:
+    """
+    Factory: returns PgVectorMemory if AGENT_DB_URL is set, otherwise SimpleMemory.
+    """
+    if os.environ.get("AGENT_DB_URL"):
+        from .pg_store import PgVectorMemory
+        return PgVectorMemory()
+    return SimpleMemory()
+
+
+__all__ = ["Memory", "SimpleMemory", "get_memory"]

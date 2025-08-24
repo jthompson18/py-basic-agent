@@ -8,7 +8,6 @@ x-app-env: &app_env
   MAX_STEPS: ${MAX_STEPS:-8}
   TEMPERATURE: ${TEMPERATURE:-0.2}
   MEMORY_BACKEND: ${MEMORY_BACKEND:-pgvector}
-  SQLITE_PATH: ${SQLITE_PATH:-/app/.data/agent.db}  # kept for optional sqlite demos
   PGHOST: ${PGHOST:-pgvector}
   PGPORT: ${PGPORT:-5432}
   PGUSER: ${PGUSER:-agent}
@@ -16,115 +15,6 @@ x-app-env: &app_env
   PGDATABASE: ${PGDATABASE:-agentdb}
 
 services:
-  pgvector:
-    image: pgvector/pgvector:pg16
-    container_name: py-basic-agent-pgvector-1
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: postgres
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
-      start_period: 10s
-
-  # One-shot: ensure role/db exist even on an existing volume
-  db-bootstrap:
-    image: postgres:16
-    depends_on:
-      pgvector:
-        condition: service_healthy
-    environment:
-      PGPASSWORD: postgres
-    command: >
-      sh -lc "psql -h pgvector -U postgres -v ON_ERROR_STOP=1 -f /bootstrap.sql"
-    volumes:
-      - ./app/db/bootstrap.sql:/bootstrap.sql:ro
-    restart: "no"
-
-  # One-shot: apply schema to agentdb (idempotent, runs as agent)
-  db-setup:
-    image: postgres:16
-    depends_on:
-      pgvector:
-        condition: service_healthy
-    environment:
-      PGPASSWORD: agentpass
-    command: >
-      sh -lc "psql -h pgvector -U agent -d agentdb -v ON_ERROR_STOP=1 -f /schema.sql"
-    volumes:
-      - ./app/db/schema.sql:/schema.sql:ro
-    restart: "no"
-
-  # App runs by default and can reach host's Ollama (Mac & Linux)
-  app:
-    build:
-      context: ./app
-    stdin_open: true
-    tty: true
-    env_file: .env
-    environment:
-      <<: *app_env
-      PYTHONPATH: /app
-      # Safe defaults; can be overridden in .env
-      AGENT_DB_URL: ${AGENT_DB_URL:-postgresql://agent:agentpass@pgvector:5432/agentdb}
-      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
-      AGENT_EMBED_MODEL: ${AGENT_EMBED_MODEL:-nomic-embed-text}
-      AGENT_EMBED_DIM: ${AGENT_EMBED_DIM:-768}
-    volumes:
-      - ./app:/app
-      - ./data:/app/data:rw
-      - ./.data:/app/.data:rw
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    depends_on:
-      pgvector:
-        condition: service_healthy
-      db-bootstrap:                # one-shot: creates role/db if missing
-        condition: service_completed_successfully
-      db-setup:                    # one-shot: applies schema.sql (idempotent)
-        condition: service_completed_successfully
-      mcpfs:
-        condition: service_started
-  
-  test:
-    build: .
-    env_file: .env
-    volumes:
-      - .:/app
-    entrypoint: pytest
-    command: -q
-    depends_on:
-      pgvector:
-        condition: service_healthy
-      mcpfs:
-        condition: service_started
-  
-  mcpfs:
-    image: node:20-alpine
-    working_dir: /srv
-    environment:
-      FS_MCP_ROOT: /app/data
-      PORT: 8765
-      ENABLE_STDIO: "0"
-    volumes:
-      - ./servers/fs-mcp-server:/srv
-      - ./data:/app/data:rw
-    command: sh -lc "npm i --omit=dev && node index.js"
-    ports:
-      - "8765:8765"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:8765/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
-
   # Optional: dockerized Ollama, only when you enable the profile
   # ollama:
   #   image: ollama/ollama:latest
@@ -147,6 +37,72 @@ services:
   #       ollama pull ${EMBED_MODEL:-nomic-embed-text}
   #       tail -f /dev/null
 
+  pgvector:
+    image: pgvector/pgvector:pg17
+    container_name: py-basic-agent-pgvector
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agentpass
+      POSTGRES_DB: agentdb
+    ports:
+      - "5432:5432"        # optional; handy for local psql
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./app/db/schema.sql:/docker-entrypoint-initdb.d/00_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agentdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  mcpfs:
+    image: node:20-alpine
+    working_dir: /srv
+    environment:
+      FS_MCP_ROOT: /app/data
+      PORT: 8765
+      ENABLE_STDIO: "0"
+    volumes:
+      - ./servers/fs-mcp-server:/srv
+      - ./data:/app/data:rw
+    command: sh -lc "npm i --omit=dev && node index.js"
+    ports:
+      - "8765:8765"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:8765/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: py-basic-agent-app
+    environment:
+      <<: *app_env
+      PYTHONPATH: /app
+      # Safe defaults; can be overridden in .env
+      AGENT_DB_URL: ${AGENT_DB_URL:-postgresql://agent:agentpass@pgvector:5432/agentdb}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      AGENT_EMBED_MODEL: ${AGENT_EMBED_MODEL:-nomic-embed-text}
+      AGENT_EMBED_DIM: ${AGENT_EMBED_DIM:-768}
+    extra_hosts:
+        - "host.docker.internal:host-gateway"
+    volumes:
+      - ./app:/app
+      - ./data:/app/data:rw
+      - ./.data:/app/.data:rw
+    depends_on:
+      pgvector:
+        condition: service_healthy
+      mcpfs:
+        condition: service_started
+    stdin_open: true
+    tty: true
+
 volumes:
-  pgdata: {}
+  pgdata:
   # ollama:

@@ -208,3 +208,5 @@ __marimo__/
 
 .data/
 data/transformed*
+
+servers/fs-mcp-server/node_modules/

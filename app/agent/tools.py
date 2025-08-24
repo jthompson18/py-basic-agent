@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import urllib.parse
 
 import httpx
@@ -11,6 +11,7 @@ from readability import Document
 from lxml import html as lxml_html
 
 from .etl import load_csv, load_json, transform, save_csv, save_json, profile
+from .memory import get_memory, Memory
 
 
 logger = logging.getLogger(__name__)
@@ -19,60 +20,36 @@ logger = logging.getLogger(__name__)
 # Memory backend (lazy)
 # ---------------------------
 
-_mem = None  # lazy singleton
+_mem: Optional[Memory] = None
 
 
-def _get_mem():
-    """
-    Try pgvector-backed memory first; fall back to in-memory.
-    """
+def _get_mem() -> Memory:
     global _mem
-    if _mem is not None:
-        return _mem
+    if _mem is None:
+        _mem = get_memory()
+    return _mem
 
-    try:
-        from .memory.pg_store import PgVectorMemory  # type: ignore
-        _mem = PgVectorMemory()
-        logger.info("Memory backend: pgvector")
-        return _mem
-    except Exception as e:
-        logger.warning(
-            "pgvector memory unavailable, using SimpleMemory; reason: %s", e)
 
-    try:
-        from .memory.simple_memory import SimpleMemory  # type: ignore
-        _mem = SimpleMemory()
-        logger.info("Memory backend: simple")
-        return _mem
-    except Exception as e:
-        # As a last resort, make a tiny fallback
-        logger.error(
-            "SimpleMemory unavailable; building minimal memory. reason: %s", e)
-
-        class _MiniMem:
-            def __init__(self):
-                self._docs: List[Dict[str, Any]] = []
-
-            async def aupsert(self, docs: List[Dict[str, Any]]):
-                self._docs.extend(docs)
-
-            async def aquery(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-                q = query.lower()
-                scored = []
-                for d in self._docs:
-                    text = (d.get("content") or "").lower()
-                    score = text.count(q) if q else 0
-                    scored.append((score, d))
-                scored.sort(key=lambda t: t[0], reverse=True)
-                return [d for _, d in scored[:k]]
-
-        _mem = _MiniMem()
-        return _mem
-
+async def memory_tool(op: str, **kwargs) -> Any:
+    mem = _get_mem()
+    if op == "remember":
+        docs = kwargs.get("docs")
+        if not isinstance(docs, list):
+            raise ValueError("`remember` requires docs: List[Dict]")
+        return {"ok": True, "count": await mem.aupsert(docs)}
+    if op == "recall":
+        q = kwargs.get("query", "")
+        k = int(kwargs.get("k", 3))
+        return await mem.aquery(q, k=k)
+    if op == "dump":
+        limit = int(kwargs.get("limit", 50))
+        return await mem.adump(limit)
+    raise ValueError(f"Unknown memory op: {op}")
 
 # ---------------------------
 # Paths
 # ---------------------------
+
 
 def _resolve_local_path(p: str) -> str:
     """
