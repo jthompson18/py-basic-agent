@@ -57,7 +57,7 @@ class PgVectorMemory:
             "AGENT_DB_URL",
             "postgresql://agent:agentpass@pgvector:5432/agentdb",
         )
-        self.dim = int(os.getenv("AGENT_EMBED_DIM", "768"))
+        self.dim = int(os.getenv("AGENT_EMBED_DIM", "384"))
         self.conn = psycopg.connect(self.db_url, autocommit=True)
         if HAVE_VECTOR:
             try:

@@ -7,7 +7,7 @@ class Settings(BaseModel):
     ollama_base_url: str = os.getenv(
         "OLLAMA_BASE_URL", "http://host.docker.internal:11434")
     model: str = os.getenv("MODEL", "llama3.1:8b")
-    embed_model: str = os.getenv("EMBED_MODEL", "nomic-embed-text")
+    embed_model: str = os.getenv("EMBED_MODEL", "all-minilm")
     max_steps: int = int(os.getenv("MAX_STEPS", "8"))
     temperature: float = float(os.getenv("TEMPERATURE", "0.2"))
     memory_backend: str = os.getenv("MEMORY_BACKEND", "pgvector")

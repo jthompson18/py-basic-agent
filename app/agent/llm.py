@@ -11,9 +11,9 @@ from .config import settings
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
 CHAT_MODEL = os.getenv("AGENT_MODEL", "llama3.1:8b")
-EMBED_MODEL = os.getenv("AGENT_EMBED_MODEL", "nomic-embed-text")
+EMBED_MODEL = os.getenv("AGENT_EMBED_MODEL", "all-minilm")
 # used by pgvector schema, not here directly
-EMBED_DIM = int(os.getenv("AGENT_EMBED_DIM", "768"))
+EMBED_DIM = int(os.getenv("AGENT_EMBED_DIM", "384"))
 
 
 # New: configurable timeouts via env, with sensible defaults

@@ -17,7 +17,9 @@ This repo is intentionally small and readable—ideal for learning how agent loo
 * [Quick start](#quick-start)
 * [Requirements](#requirements)
 * [Setup (Linux / macOS / Windows)](#setup-linux--macos--windows)
+* [Ollama hosting](#ollama-hosting)
 * [Environment variables](#environment-variables)
+* [Reset after embedding update](#reset-after-embedding-update)
 * [How it works (core concepts)](#how-it-works-core-concepts)
 * [Using the REPL](#using-the-repl)
 * [ETL mini-DSL](#etl-mini-dsl)
@@ -28,6 +30,8 @@ This repo is intentionally small and readable—ideal for learning how agent loo
 ---
 
 ## Quick start
+
+> Before you start: make sure **Ollama is running and reachable**. See [Ollama hosting](#ollama-hosting) for OS-specific setup (macOS runs Ollama outside Docker; Linux/Windows may use the optional `ollama` service).
 
 ```bash
 # 1) Start dependencies (DB + optional MCP file server)
@@ -63,7 +67,7 @@ You don’t need Python locally. Everything runs in containers.
 
     ```bash
     ollama pull llama3.1:8b
-    ollama pull nomic-embed-text
+    ollama pull all-minilm
     ```
   * make sure Ollama is reachable from Docker at `http://host.docker.internal:11434`
 * \~2–4 GB free RAM for the small models
@@ -88,7 +92,7 @@ Update values as needed (see [Environment variables](#environment-variables)).
 docker compose up -d pgvector mcpfs
 ```
 
-> The pgvector container auto-creates the database, role, and tables via the mounted `schema.sql`. No manual DB bootstrapping needed.
+> The pgvector container auto-creates the database, role, and tables via the mounted `db/schema.sql`. No manual DB bootstrapping needed.
 
 ### 3) Run the REPL
 
@@ -109,6 +113,26 @@ docker compose run --rm app
 
 ---
 
+## Ollama hosting
+
+**macOS (recommended):** run Ollama **outside** Docker (host app). This is required on macOS so the models can use Metal and to avoid Docker networking issues. Keep `OLLAMA_HOST=http://host.docker.internal:11434`.
+
+**Linux/Windows (optional in-container):** you may run Ollama **as a container** with Compose. Open `docker-compose.yml` and **uncomment** the `ollama:` service block, then start it:
+
+```bash
+docker compose up -d ollama
+# (and usually alongside other deps)
+docker compose up -d pgvector mcpfs ollama
+```
+
+When running the in-container service, set in your `.env`:
+
+```
+OLLAMA_HOST=http://ollama:11434
+```
+
+> ⚠️ **Experimental**: the dockerized Ollama path is not 100% tested here and may be flaky depending on GPU drivers and container permissions. If you hit timeouts or slow responses, prefer running Ollama on the host and keep `OLLAMA_HOST` pointed at `host.docker.internal:11434`.
+
 ## Environment variables
 
 All live in `.env`. Defaults are safe for local use.
@@ -120,8 +144,8 @@ All live in `.env`. Defaults are safe for local use.
 | `AGENT_TEMPERATURE` | LLM sampling temperature (float).                                     | `0.2`                                                |
 | `AGENT_MAX_STEPS`   | Agent loop max tool steps before giving up.                           | `8`                                                  |
 | `AGENT_DB_URL`      | Postgres URL used by `PgVectorMemory`. Provided by compose.           | `postgresql://agent:agentpass@pgvector:5432/agentdb` |
-| `AGENT_EMBED_MODEL` | Embedding model name in Ollama.                                       | `nomic-embed-text`                                   |
-| `AGENT_EMBED_DIM`   | Embedding vector dimension. **Must match schema.sql**.                | `768`                                                |
+| `AGENT_EMBED_MODEL` | Embedding model name in Ollama.                                       | `all-minilm`                                         |
+| `AGENT_EMBED_DIM`   | Embedding vector dimension. **Must match schema.sql**.                | `384`                                                |
 | `SERPER_API_KEY`    | API key for the Serper search tool (if enabled).                      | `sk-...`                                             |
 | `AGENT_VERBOSE`     | Controls extra logging in some contexts (`true/false`).               | `true`                                               |
 
@@ -139,6 +163,43 @@ All live in `.env`. Defaults are safe for local use.
     ```
 
 ---
+
+## Reset after embedding update
+
+If you change `AGENT_EMBED_MODEL` or `AGENT_EMBED_DIM`, you must ensure the database vector dimension matches the embedding dimension. Easiest path is to recreate the DB volume (it is auto-initialized from `db/schema.sql`).
+
+1. Edit `.env` to the new model & dim (defaults use `all-minilm`):
+
+   * `AGENT_EMBED_MODEL=all-minilm`
+   * `AGENT_EMBED_DIM=384`
+2. Edit `db/schema.sql` to match:
+
+   ```sql
+   -- docs table
+   embedding VECTOR(384)
+   ```
+3. Drop and rebuild Postgres (recreates volume and schema):
+
+   ```bash
+   docker compose down -v
+   docker compose up -d pgvector
+   ```
+4. (Optional) verify the table shape:
+
+   ```bash
+   docker compose exec -T pgvector psql -X -U agent -d agentdb -c "\d+ docs"
+   ```
+5. Restart the REPL:
+
+   ```bash
+   docker compose run --rm app
+   ```
+
+> Prefer a migration instead of dropping the volume? Run:
+>
+> ```sql
+> ALTER TABLE docs ALTER COLUMN embedding TYPE vector(384);
+> ```
 
 ## How it works (core concepts)
 
@@ -229,9 +290,90 @@ Check a path:
 /where ./data/sales_orders.csv
 ```
 
+### Examples (commands & expected output)
+
+> These are abridged. Exact wording may vary, but the flow (MODEL → TOOL CALL/RESULT → final answer) should look similar.
+
+**Research**
+
+```
+/research Who founded NVIDIA and when?
+```
+
+*Expected excerpt:*
+
+```
+Step 1/8
+MODEL: {"tool":"search","input":{"query":"NVIDIA founders"}}
+TOOL CALL: search {"query": "NVIDIA founders"}
+TOOL RESULT: search → (top links...)
+...
+Answer
+NVIDIA was founded in 1993 by Jensen Huang, Chris Malachowsky, and Curtis Priem.
+
+Sources:
+- Wikipedia — https://en.wikipedia.org/wiki/Nvidia
+- NVIDIA Corporate Timeline — https://www.nvidia.com/en-us/about-nvidia/corporate-timeline/
+```
+
+**ETL (local file)**
+
+```
+/etl -p ./data/sales_orders.csv -t "reorder:date,region,product,units,unit_price; rename:unit_price->price; limit:3" -l ./data/sales_orders.sample.parquet
+```
+
+*Expected excerpt:*
+
+```
+TOOL RESULT: etl → ETL DONE: saved ./data/sales_orders.sample.parquet (rows: 3)
+```
+
+**ETL from a URL**
+
+> Tip: Browse free CSV/JSON datasets at Data.gov’s catalog: [https://catalog.data.gov/dataset/](https://catalog.data.gov/dataset/) . Use a **direct** CSV/JSON file URL.
+
+```
+/etl_from_source -p https://people.sc.fsu.edu/~burkardt/data/csv/airtravel.csv \
+  -t "reorder:Month,1958,1959; rename:1958->y1958; limit:5" \
+  -l ./data/airtravel_top5.csv
+```
+
+*Expected excerpt:*
+
+```
+TOOL RESULT: etl → ETL DONE: saved ./data/airtravel_top5.csv (rows: 5)
+```
+
+**MCP file listing**
+
+```
+/mcp add-http -n fs -u http://host.docker.internal:8765
+/mcp call fs list_files '{"path":"./data"}'
+```
+
+*Expected excerpt:*
+
+```
+TOOL RESULT: mcp:fs:list_files → ["customers.json","sales_orders.csv", ...]
+```
+
+**Path helper**
+
+```
+/where ./data/customers.json
+```
+
+*Expected excerpt:*
+
+```
+Resolved: /app/data/customers.json (exists, ~2.4 KB)
+```
+
 ---
 
 ## ETL mini-DSL
+
+> Tip: Need a URL for `/etl_from_source`? Browse open datasets at **Data.gov**: [https://catalog.data.gov/dataset/](https://catalog.data.gov/dataset/) — copy a **direct** CSV/JSON link.
 
 Transform spec (semicolon-chained):
 
@@ -304,26 +446,43 @@ In the REPL:
 ## Project layout
 
 ```
-agent/
-  __main__.py             # Typer entrypoint → REPL
-  core.py                 # Agent loop (LLM ↔ tools ↔ memory)
-  llm.py                  # Ollama chat + embeddings
-  tools.py                # search, fetch, etl, memory router
-  repl.py                 # Rich/prompt_toolkit REPL
-  schemas.py              # Message, ToolCall, StepResult types
-  config.py               # settings (reads .env)
-  memory/
-    simple.py             # SimpleMemory (substring search)
-    pg_store.py           # PgVectorMemory (cosine similarity)
-    __init__.py           # get_memory() selector
-docker/
-  schema.sql              # Creates role/db/tables + pgvector
-data/
-  customers.json
-  sales_orders.csv
+.
+├─ app/
+│  ├─ agent/
+│  │  ├─ __init__.py
+│  │  ├─ __main__.py          # Typer entrypoint → REPL
+│  │  ├─ core.py              # Agent loop (LLM ↔ tools ↔ memory)
+│  │  ├─ llm.py               # Ollama chat + embeddings
+│  │  ├─ tools.py             # search, fetch, etl, memory router
+│  │  ├─ repl.py              # interactive CLI (Rich + prompt_toolkit)
+│  │  ├─ schemas.py           # Message, ToolCall, StepResult models
+│  │  ├─ config.py            # settings (.env)
+│  │  └─ memory/
+│  │     ├─ __init__.py       # get_memory() selector
+│  │     ├─ simple_memory.py  # SimpleMemory (substring search)
+│  │     ├─ pg_store.py       # PgVectorMemory (cosine similarity)
+│  │     └─ types.py          # Protocol / shared types
+│  ├─ data/                   # sample datasets for ETL (container mount)
+│  ├─ Dockerfile              # app image
+│  └─ requirements.txt
+├─ data/                      # shared sample datasets (bind-mounted)
+├─ db/
+│  └─ schema.sql              # pgvector bootstrap (mounted by pgvector)
+├─ servers/
+│  └─ fs-mcp-server/          # MCP HTTP FS tool (Node)
+│     ├─ index.js
+│     ├─ package.json
+│     └─ README.md
+├─ compose.yml                # Docker Compose for app + deps
+├─ .env.example               # example env; copy to .env
+└─ README.md
 ```
 
----
+**Notes**
+
+* Compose mounts **`db/schema.sql`** into Postgres to enable pgvector and create the `docs` table.
+* The REPL and agent live under `app/agent`. Root-level `data/` is bind-mounted into the container so you can point ETL commands at local files.
+* The optional MCP FS server (`servers/fs-mcp-server`) exposes `list_files`, `read_text`, `write_text`, and `stat` over HTTP; connect from the REPL with `/mcp add-http ...`.
 
 ## What to read next
 

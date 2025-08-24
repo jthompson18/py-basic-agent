@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS docs (
   uri       TEXT NOT NULL,
   meta      JSONB,
   content   TEXT NOT NULL,
-  embedding VECTOR(768),               -- match AGENT_EMBED_DIM (nomic-embed-text = 768)
+  embedding VECTOR(384),               -- match AGENT_EMBED_DIM (all-minilm = 384)
   UNIQUE (source, uri)
 );
 

@@ -3,7 +3,7 @@ x-app-env: &app_env
   # Default to HOST ollama; change to http://ollama:11434 when using dockerized Ollama
   OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
   MODEL: ${MODEL:-llama3.1:8b}
-  EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
+  EMBED_MODEL: ${EMBED_MODEL:-all-minilm}
   SERPER_API_KEY: ${SERPER_API_KEY}
   MAX_STEPS: ${MAX_STEPS:-8}
   TEMPERATURE: ${TEMPERATURE:-0.2}
@@ -34,7 +34,7 @@ services:
   #     - |
   #       ollama serve & sleep 2
   #       ollama pull ${MODEL:-llama3.1:8b}
-  #       ollama pull ${EMBED_MODEL:-nomic-embed-text}
+  #       ollama pull ${EMBED_MODEL:-all-minilm}
   #       tail -f /dev/null
 
   pgvector:
@@ -87,8 +87,8 @@ services:
       # Safe defaults; can be overridden in .env
       AGENT_DB_URL: ${AGENT_DB_URL:-postgresql://agent:agentpass@pgvector:5432/agentdb}
       OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
-      AGENT_EMBED_MODEL: ${AGENT_EMBED_MODEL:-nomic-embed-text}
-      AGENT_EMBED_DIM: ${AGENT_EMBED_DIM:-768}
+      AGENT_EMBED_MODEL: ${AGENT_EMBED_MODEL:-all-minilm}
+      AGENT_EMBED_DIM: ${AGENT_EMBED_DIM:-384}
     extra_hosts:
         - "host.docker.internal:host-gateway"
     volumes:
