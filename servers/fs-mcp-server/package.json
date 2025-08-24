@@ -1,0 +1,13 @@
+{
+  "name": "fs-mcp-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Tiny filesystem MCP server (HTTP) sandboxed by FS_MCP_ROOT",
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.16.0",
+    "express": "^4.19.2"
+  }
+}

@@ -1,86 +1,115 @@
 # app/agent/memory/pg_store.py
-from typing import List, Dict, Any
+from __future__ import annotations
+
+import asyncio
+import json
 import os
-import numpy as np
+from typing import Any, Dict, List
+
 import psycopg
+from psycopg.rows import dict_row
 from pgvector.psycopg import register_vector
-from psycopg.types.json import Json
-from ..embeddings import embed_texts
-from ..config import settings
+
+DB_URL = os.getenv(
+    "AGENT_DB_URL", "postgresql://agent:agentpass@pgvector:5432/agentdb")
+TABLE = os.getenv("AGENT_PGVECTOR_TABLE", "docs")
+# must match your embedding model
+EMBED_DIM = int(os.getenv("AGENT_EMBED_DIM", "768"))
 
 
 class PgVectorMemory:
-    def __init__(self):
-        # autocommit so DDL is immediate
-        self.conn = psycopg.connect(
-            host=settings.pghost,
-            port=settings.pgport,
-            user=settings.pguser,
-            password=settings.pgpassword,
-            dbname=settings.pgdatabase,
-            autocommit=True,
-        )
-        with self.conn.cursor() as cur:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        # register pgvector adapters with this connection
+    """
+    Simple pgvector-backed memory with async insert/query.
+    Requires:
+      - PostgreSQL with pgvector installed
+      - Table with embedding VECTOR(EMBED_DIM)
+      - An async embedder (agent.llm.embed_texts)
+    """
+
+    def __init__(self, db_url: str | None = None):
+        self.db_url = db_url or DB_URL
+        self.conn = psycopg.connect(self.db_url, autocommit=True)
         register_vector(self.conn)
+        self._ensure_schema()
 
-        # choose dim without calling embeddings here
-        dim = int(os.getenv("EMBED_DIM") or "768")
-
+    def _ensure_schema(self) -> None:
         with self.conn.cursor() as cur:
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS docs(
-                    id BIGSERIAL PRIMARY KEY,
-                    source   TEXT,
-                    uri      TEXT,
-                    meta     JSONB,
-                    content  TEXT,
-                    embedding VECTOR({dim})
-                );
-            """)
+            # Ensure extension & table exist
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
             cur.execute(
-                "CREATE INDEX IF NOT EXISTS docs_uri_idx ON docs (uri);")
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS docs_embedding_idx
-                ON docs USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-            """)
+                f"""
+                CREATE TABLE IF NOT EXISTS {TABLE} (
+                  id BIGSERIAL PRIMARY KEY,
+                  source   TEXT NOT NULL,
+                  uri      TEXT NOT NULL,
+                  meta     JSONB,
+                  content  TEXT NOT NULL,
+                  embedding VECTOR({EMBED_DIM}),
+                  UNIQUE (source, uri)
+                );
+                """
+            )
+            # Optional indexes:
+            # cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{TABLE}_embedding ON {TABLE} USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);")
 
-    # ---- async API ----
+    # ---------- public async API ----------
 
-    async def aupsert(self, docs: List[Dict[str, Any]]) -> None:
-        texts = [d["content"] for d in docs]
-        embs = await embed_texts(texts)  # -> list of lists
+    async def aupsert(self, docs: List[Dict[str, Any]]) -> int:
+        """
+        Insert or update docs with fresh embeddings.
+        doc: {content:str, source:str, uri:str, meta:dict}
+        """
+        contents = [d.get("content", "") for d in docs]
+        # embed
+        from ..llm import embed_texts
+        vectors = await embed_texts(contents)
+
         with self.conn.cursor() as cur:
-            for d, v in zip(docs, embs):
-                # psycopg3 pgvector adapter expects numpy
-                vec = np.asarray(v, dtype="float32")
+            for d, vec in zip(docs, vectors):
                 cur.execute(
-                    """
-                    INSERT INTO docs (source, uri, meta, content, embedding)
+                    f"""
+                    INSERT INTO {TABLE} (source, uri, meta, content, embedding)
                     VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (source, uri) DO UPDATE
+                    SET meta = EXCLUDED.meta,
+                        content = EXCLUDED.content,
+                        embedding = EXCLUDED.embedding;
                     """,
                     (
-                        d.get("source"),
-                        d.get("uri"),
-                        Json(d.get("meta") or {}),
-                        d["content"],
-                        vec,
+                        d.get("source", ""),
+                        d.get("uri", ""),
+                        json.dumps(d.get("meta", {})),
+                        d.get("content", ""),
+                        vec,  # pgvector adapts Python list automatically
                     ),
                 )
+        return len(docs)
 
-    async def aquery(self, text: str, k: int = 5) -> List[Dict[str, Any]]:
-        q = (await embed_texts([text]))[0]
-        qv = np.asarray(q, dtype="float32")
-        with self.conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+    async def aquery(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+        """
+        Vector similarity search using cosine distance (<=>).
+        Returns rows ordered by best match.
+        """
+        from ..llm import embed_texts
+        qvec = (await embed_texts([query]))[0]
+        with self.conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                """
+                f"""
                 SELECT source, uri, meta, content,
-                       1 - (embedding <=> %s) AS similarity
-                FROM docs
+                       1 - (embedding <=> %s) AS score
+                FROM {TABLE}
                 ORDER BY embedding <=> %s
-                LIMIT %s
+                LIMIT %s;
                 """,
-                (qv, qv, k),
+                (qvec, qvec, k),
             )
-            return cur.fetchall()
+            rows = cur.fetchall()
+        return rows
+
+    # ---------- optional sync wrappers ----------
+
+    def upsert(self, docs: List[Dict[str, Any]]) -> int:
+        return asyncio.run(self.aupsert(docs))
+
+    def query(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+        return asyncio.run(self.aquery(query, k))

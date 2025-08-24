@@ -1,7 +1,16 @@
 # app/agent/llm.py
 import httpx
 import json
+import os
+import asyncio
 from .config import settings
+from __future__ import annotations
+from typing import List
+
+OLLAMA_HOST = os.getenv(
+    "OLLAMA_HOST", "http://host.docker.internal:11434").rstrip("/")
+EMBED_MODEL = os.getenv("AGENT_EMBED_MODEL", "nomic-embed-text")
+EMBED_DIM = int(os.getenv("AGENT_EMBED_DIM", "768"))
 
 SYSTEM_PROMPT = """You are a research + data agent.
 
@@ -18,6 +27,60 @@ TOOLS: Call ONE tool per step by replying ONLY with JSON inside a fenced block:
 When done, reply with:
 {"final":"...answer with sources and any saved dataset paths..."}
 """
+
+
+async def _embed_one(client: httpx.AsyncClient, text: str) -> List[float]:
+    """
+    Call Ollama /api/embeddings for a single text.
+    Tries 'input' first (current API), falls back to 'prompt' for older daemons.
+    Returns a list[float].
+    """
+    # Try 'input'
+    r = await client.post(
+        f"{OLLAMA_HOST}/api/embeddings",
+        json={"model": EMBED_MODEL, "input": text},
+        timeout=30.0,
+    )
+    if r.status_code >= 400:
+        # Fallback: older servers expect 'prompt'
+        r = await client.post(
+            f"{OLLAMA_HOST}/api/embeddings",
+            json={"model": EMBED_MODEL, "prompt": text},
+            timeout=30.0,
+        )
+    r.raise_for_status()
+    data = r.json()
+    # Common shapes: {"embedding":[...]} or {"data":[{"embedding":[...]}]}
+    if "embedding" in data and isinstance(data["embedding"], list):
+        return data["embedding"]
+    if "data" in data and isinstance(data["data"], list) and data["data"]:
+        item = data["data"][0]
+        if isinstance(item, dict) and isinstance(item.get("embedding"), list):
+            return item["embedding"]
+    raise RuntimeError(f"Unexpected embeddings response shape: {data}")
+
+
+async def embed_texts(texts: List[str]) -> List[List[float]]:
+    """
+    Batch embed via Ollama. Sequential calls keep it simple/reliable.
+    """
+    if not texts:
+        return []
+    async with httpx.AsyncClient() as client:
+        out: List[List[float]] = []
+        for t in texts:
+            vec = await _embed_one(client, t)
+            if EMBED_DIM and len(vec) != EMBED_DIM:
+                # If dimension mismatch, you can either resize or raise.
+                # We'll raise so you notice misconfig (e.g. using an 1024-d model).
+                raise ValueError(
+                    f"Embedding dim {len(vec)} != expected {EMBED_DIM}. "
+                    "Set AGENT_EMBED_DIM to match your model."
+                )
+            out.append(vec)
+        return out
+
+# ---- (optional) stubs other code may import ----------------------------------
 
 
 async def _chat_v1(messages: list[dict], temperature: float | None) -> str:

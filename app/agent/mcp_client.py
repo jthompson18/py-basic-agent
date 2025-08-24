@@ -1,112 +1,170 @@
+# app/agent/mcp_client.py
 from __future__ import annotations
+
 import asyncio
-import os
-import shlex
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-HAS_MCP = True
 try:
-    # Expected modern MCP Python client
-    from mcp import StdioServer, ClientSession  # type: ignore
+    import httpx
+    HAS_MCP_HTTP = True
 except Exception:
-    HAS_MCP = False
+    httpx = None  # type: ignore
+    HAS_MCP_HTTP = False
+
+# Optional stdio client (not required for HTTP-only)
+try:
+    # If you have or add a stdio client, import it here.
+    HAS_MCP_STDIO = False
+except Exception:
+    HAS_MCP_STDIO = False
 
 
-class MCPConnection:
+class HttpMCPClient:
+    """Minimal HTTP client for an MCP façade:
+       GET  /health
+       GET  /tools
+       POST /call
     """
-    Simple stdio MCP connection wrapper.
-    """
 
-    def __init__(self, name: str, command: str, env: Optional[Dict[str, str]] = None):
-        self.name = name
-        self.command = command
-        self.env = env or {}
-        self._server = None
-        self._session = None
+    def __init__(self, base_url: str, timeout: float = 30.0):
+        if not HAS_MCP_HTTP:
+            raise RuntimeError("httpx not installed; HTTP MCP unavailable.")
+        self.base = base_url.rstrip("/")
+        self.client = httpx.AsyncClient(timeout=timeout, headers={
+                                        "Content-Type": "application/json"})
 
-    async def start(self):
-        if not HAS_MCP:
-            raise RuntimeError(
-                "MCP Python client not installed. Add `mcp` to requirements.txt and rebuild.")
-        cmd = shlex.split(self.command)
-        # Launch MCP server over stdio
-        # type: ignore[attr-defined]
-        self._server = await StdioServer.create(command=cmd, env={**os.environ, **self.env})
-        # type: ignore[attr-defined]
-        self._session = await ClientSession.create(self._server)
+    async def health(self) -> Dict[str, Any]:
+        r = await self.client.get(f"{self.base}/health")
+        r.raise_for_status()
+        return r.json()
 
-    async def stop(self):
-        try:
-            if self._session:
-                await self._session.close()
-        finally:
-            self._session = None
-            if self._server:
-                await self._server.close()
-            self._server = None
+    async def list_tools(self) -> Any:
+        r = await self.client.get(f"{self.base}/tools")
+        r.raise_for_status()
+        # Some facades return {"tools":[...]}, others might embed content
+        return r.json()
 
-    async def list_tools(self) -> List[Dict[str, Any]]:
-        if not self._session:
-            raise RuntimeError("MCP connection not started")
-        # returns [{'name':'toolName','description':'...','input_schema':{...}}, ...]
-        return await self._session.list_tools()  # type: ignore[attr-defined]
+    async def call(self, tool: str, args: Dict[str, Any]) -> Any:
+        """Try multiple payload shapes to maximize compatibility."""
+        attempts: List[Tuple[str, Dict[str, Any]]] = [
+            ("name_arguments",    {"name": tool, "arguments": args}),
+            ("tool_arguments",    {"tool": tool, "arguments": args}),
+            ("tool_args",         {"tool": tool, "args": args}),
+        ]
 
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
-        if not self._session:
-            raise RuntimeError("MCP connection not started")
-        # returns provider-defined result (structured)
-        # type: ignore[attr-defined]
-        return await self._session.call_tool(tool_name, arguments)
+        last_err: Optional[Exception] = None
+        for label, payload in attempts:
+            try:
+                resp = await self.client.post(f"{self.base}/call", json=payload)
+                if 200 <= resp.status_code < 300:
+                    # Success
+                    return resp.json()
+                # 400/422 are most likely schema mismatches; try next shape
+                if resp.status_code in (400, 422):
+                    last_err = httpx.HTTPStatusError(
+                        f"{resp.status_code} for payload shape '{label}': {resp.text}",
+                        request=resp.request, response=resp
+                    )
+                    continue
+                # Other HTTP errors: raise
+                resp.raise_for_status()
+            except Exception as e:  # network, JSON, etc.
+                last_err = e
+                continue
+
+        # If we got here, all shapes failed
+        if last_err:
+            raise last_err
+        raise RuntimeError("MCP /call failed with unknown error")
+
+    async def close(self):
+        await self.client.aclose()
 
 
 class MCPManager:
-    """
-    In-memory registry of MCP stdio servers.
-    """
+    """Orchestrates multiple MCP servers (HTTP and optionally stdio)."""
 
     def __init__(self):
-        self._conns: Dict[str, MCPConnection] = {}
+        self.http_clients: Dict[str, HttpMCPClient] = {}
+        # self.stdio_clients: Dict[str, ...] = {}
         self.default_name: Optional[str] = None
 
-    async def add_stdio(self, name: str, command: str, env: Optional[Dict[str, str]] = None):
-        if name in self._conns:
-            raise ValueError(f"MCP server '{name}' already exists")
-        conn = MCPConnection(name, command, env)
-        await conn.start()
-        self._conns[name] = conn
+    # ---------- HTTP ----------
+    async def add_http(self, name: str, base_url: str):
+        if name in self.http_clients:
+            # Replace if re-adding
+            try:
+                await self.http_clients[name].close()
+            except Exception:
+                pass
+        self.http_clients[name] = HttpMCPClient(base_url)
+        # Set default if none
         if not self.default_name:
             self.default_name = name
 
-    async def remove(self, name: str):
-        conn = self._conns.pop(name, None)
-        if conn:
-            await conn.stop()
-        if self.default_name == name:
-            self.default_name = next(iter(self._conns), None)
+    # ---------- stdio (placeholder) ----------
+    async def add_stdio(self, name: str, command: str, env: Optional[Dict[str, str]] = None):
+        raise RuntimeError("MCP stdio client not implemented in this build.")
 
+    # ---------- common ----------
     def list_servers(self) -> List[str]:
-        return list(self._conns.keys())
+        names = set(self.http_clients.keys())
+        # names |= set(self.stdio_clients.keys())
+        return sorted(names)
 
     def set_default(self, name: str):
-        if name not in self._conns:
-            raise KeyError(f"No MCP server named '{name}'")
+        if name not in self.http_clients:  # and name not in self.stdio_clients
+            raise RuntimeError(f"No such MCP server: {name}")
         self.default_name = name
 
-    async def list_tools(self, name: Optional[str] = None) -> List[Dict[str, Any]]:
-        conn = self._require(name)
-        return await conn.list_tools()
+    def _resolve(self, name: Optional[str]) -> Tuple[str, str]:
+        # Returns a tuple (kind, name): kind = "http" | "stdio"
+        if name is None:
+            if not self.default_name:
+                raise RuntimeError("No default MCP server set.")
+            name = self.default_name
+        if name in self.http_clients:
+            return ("http", name)
+        # if name in self.stdio_clients:
+        #     return ("stdio", name)
+        raise RuntimeError(f"No such MCP server: {name}")
 
-    async def call(self, tool: str, arguments: Dict[str, Any], server: Optional[str] = None) -> Any:
-        conn = self._require(server)
-        return await conn.call_tool(tool, arguments)
+    async def list_tools(self, name: Optional[str] = None) -> Any:
+        kind, n = self._resolve(name)
+        if kind == "http":
+            return await self.http_clients[n].list_tools()
+        # stdio path would go here
+        raise RuntimeError("Unsupported MCP kind.")
 
-    def _require(self, name: Optional[str]) -> MCPConnection:
-        effective = name or self.default_name
-        if not effective or effective not in self._conns:
-            raise KeyError(
-                "No MCP server connected. Use `/mcp add -n <name> -c \"<command>\"` first.")
-        return self._conns[effective]
+    async def call(self, tool: str, args: Dict[str, Any], server_name: Optional[str] = None) -> Any:
+        kind, n = self._resolve(server_name)
+        if kind == "http":
+            return await self.http_clients[n].call(tool, args)
+        # stdio path would go here
+        raise RuntimeError("Unsupported MCP kind.")
+
+    async def remove(self, name: str):
+        if name in self.http_clients:
+            try:
+                await self.http_clients[name].close()
+            finally:
+                del self.http_clients[name]
+                if self.default_name == name:
+                    self.default_name = self.list_servers(
+                    )[0] if self.list_servers() else None
+            return
+        # if name in self.stdio_clients: ...
+        raise RuntimeError(f"No such MCP server: {name}")
+
+    async def close_all(self):
+        for c in list(self.http_clients.values()):
+            try:
+                await c.close()
+            except Exception:
+                pass
+        self.http_clients.clear()
+        self.default_name = None
 
 
-# Global singleton
+# Single instance used by the REPL
 mcp_manager = MCPManager()
