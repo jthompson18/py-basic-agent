@@ -28,6 +28,7 @@ from .core import run_agent
 from . import tools, llm
 from .memory import get_memory
 from .schemas import Message
+from .research import answer_research
 
 # --- console: auto color when TTY; honor NO_COLOR ---
 NO_COLOR = bool(os.environ.get("NO_COLOR")) or (not sys.stdout.isatty())
@@ -586,7 +587,18 @@ def run_repl(verbose: bool = True) -> None:
 
         if line.startswith("/research "):
             _, q = line.split(" ", 1)
-            run_task(q, verbose=verbose)
+            try:
+                res = asyncio.run(answer_research(q))
+                console.rule("[white]Answer")
+                console.print(res["answer"])
+                if res.get("citations"):
+                    console.print("[bright_black]Citations:[/]")
+                    for c in res["citations"]:
+                        console.print(f"  - {c}")
+                console.rule()
+            except Exception as e:
+                console.print(
+                    f"[red]research error:[/] {type(e).__name__}: {e}")
             continue
 
         if line.startswith("/etl "):

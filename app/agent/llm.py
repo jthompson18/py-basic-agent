@@ -86,30 +86,54 @@ def _as_chat_payload(messages: List[Message], temperature: float) -> Dict:
     }
 
 
-async def chat(messages: List[Message], temperature: float = 0.2) -> str:
+async def chat(
+    messages: list[Message],
+    temperature: float = 0.2,
+    system_extra: str | None = None,
+) -> str:
+    """
+    Chat with the configured Ollama model.
+
+    - messages: list[Message] with roles 'system' | 'user' | 'assistant'
+    - temperature: float
+    - system_extra: optional string that will be APPENDED to the first system message
+      (or used to create one if none exists). This lets callers (e.g., research)
+      add mode-specific guidance without changing the global system prompt.
+    """
+    # Merge/append system guidance as requested
+    if system_extra:
+        if messages and messages[0].role == "system":
+            merged = messages[0].content + \
+                ("\n\n" if messages[0].content else "") + system_extra
+            messages = [Message(role="system", content=merged)] + messages[1:]
+        else:
+            base = SYSTEM_PROMPT or ""
+            merged = base + (("\n\n" + system_extra) if base else system_extra)
+            messages = [Message(role="system", content=merged)] + messages
+
     payload = _as_chat_payload(messages, temperature)
 
-    timeouts = httpx.Timeout(
-        connect=CONNECT_TIMEOUT, read=READ_TIMEOUT, write=WRITE_TIMEOUT, pool=POOL_TIMEOUT
-    )
-    # A couple quick retries handle cold model spins or flaky networking.
-    retriable = (httpx.ReadTimeout, httpx.RemoteProtocolError)
+    # Prepare Ollama request
+    ollama_host = os.getenv(
+        "OLLAMA_HOST", "http://host.docker.internal:11434").rstrip("/")
 
-    async with httpx.AsyncClient(base_url=OLLAMA_HOST, timeout=timeouts) as client:
-        for attempt in range(3):
-            try:
-                r = await client.post("/api/chat", json=payload)
-                r.raise_for_status()
-                data = r.json()
-                # Ollama can return {"message":{"content":...}} or {"response":...}
-                text = (data.get("message", {}) or {}).get(
-                    "content") or data.get("response") or ""
-                return (text or "").strip()
-            except retriable as e:
-                if attempt == 2:
-                    raise
-                # small backoff; first retry is quick, second a bit longer
-                await asyncio.sleep(1 + attempt)
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(f"{ollama_host}/api/chat", json=payload)
+        r.raise_for_status()
+        data = r.json()
+
+    # Handle typical Ollama responses
+    if isinstance(data, dict):
+        if "message" in data and isinstance(data["message"], dict):
+            return data["message"].get("content", "")
+        # Some builds return a list of messages
+        if "messages" in data and isinstance(data["messages"], list) and data["messages"]:
+            return data["messages"][-1].get("content", "")
+        # Fallback to string
+        return str(data)
+
+    # Unknown shape
+    return ""
 
 
 # ---------- embeddings (used by pgvector memory) ----------
