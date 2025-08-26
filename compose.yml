@@ -89,12 +89,14 @@ services:
       OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
       AGENT_EMBED_MODEL: ${AGENT_EMBED_MODEL:-all-minilm}
       AGENT_EMBED_DIM: ${AGENT_EMBED_DIM:-384}
+      KB_PATH: /knowledge
     extra_hosts:
         - "host.docker.internal:host-gateway"
     volumes:
       - ./app:/app
       - ./data:/app/data:rw
       - ./.data:/app/.data:rw
+      - ./knowledge:/knowledge:ro
     depends_on:
       pgvector:
         condition: service_healthy

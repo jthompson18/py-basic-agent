@@ -1,4 +1,3 @@
-# app/agent/repl.py
 from __future__ import annotations
 
 import asyncio
@@ -7,10 +6,16 @@ import os
 import shlex
 import sys
 import threading
+import re
 import urllib.parse
-from typing import Dict
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
 
-from rich.console import Console
+from rich.console import Console, Group
+from rich.panel import Panel
+from rich.text import Text
+from rich import box
+
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -21,13 +26,14 @@ from prompt_toolkit.document import Document
 from .mcp_client import mcp_manager, HAS_MCP_STDIO, HAS_MCP_HTTP
 from .core import run_agent
 from . import tools, llm
+from .memory import get_memory
+from .schemas import Message
 
 # --- console: auto color when TTY; honor NO_COLOR ---
 NO_COLOR = bool(os.environ.get("NO_COLOR")) or (not sys.stdout.isatty())
 console = Console(no_color=NO_COLOR)
 
 # ---------- single background asyncio loop for all MCP work ----------
-
 _BG_LOOP: asyncio.AbstractEventLoop | None = None
 _BG_THREAD: threading.Thread | None = None
 
@@ -41,6 +47,7 @@ def _ensure_bg_loop() -> asyncio.AbstractEventLoop:
     def _runner():
         asyncio.set_event_loop(loop)
         loop.run_forever()
+
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
     _BG_LOOP = loop
@@ -70,78 +77,64 @@ def _shutdown_bg_loop():
         pass
     _BG_LOOP = None
 
-# ---------- tiny helpers ----------
 
-
+# ---------- help ----------
 def _help_text() -> str:
     return """[bold]Agent REPL — Help[/]
 
 [bold]Commands[/]
-  [green]/research <question>[/]                  
-      Run a research task (Serper search + page fetch + LLM summaries).
+[green]/research <question>[/]  Run a research task (Serper search + page fetch + LLM summaries).
+[green]/etl -p <path> -t "<transform>" [-l <out>][/]  Local ETL with flags.
+  • [bold]-p[/bold] [white]<path>[/white] (required) — CSV or JSON file in your repo (mounted to /app or /app/data).
+  • [bold]-t[/bold] [white]"..."[/white] (required) — transform DSL (see below).
+  • [bold]-l[/bold] [white]<path>[/white] (optional) — output path.
+    - If omitted, saves to [white]./data/transformed_<input>[/white] with format mirrored from input.
+    - Format is taken from the [white]-l[/white] extension if given (e.g., .csv or .json).
+[green]/etl_from_source -p <url> -t "<transform>" [-l <out>][/]  Remote ETL from a URL ending in .csv or .json.
 
-  [green]/etl -p <path> -t "<transform>" [-l <out>][/]
-      Local ETL with flags.
-      • [bold]-p[/bold]  [white]<path>[/white] (required) — CSV or JSON file in your repo (mounted to /app or /app/data).
-      • [bold]-t[/bold]  [white]"<transform>"[/white] (required) — transform DSL (see below).
-      • [bold]-l[/bold]  [white]<out>[/white] (optional) — output path.
-          - If omitted, saves to [white]./data/transformed_<input_basename>[/white] with format mirrored from input.
-          - Format is taken from the [white]-l[/white] extension if given (e.g., .csv or .json).
+[green]/where <path>[/]  Show how a local path resolves inside the container and whether it exists.
 
-  [green]/etl_from_source -p <url> -t "<transform>" [-l <out>][/]
-      Remote ETL from a URL ending in .csv or .json (validated).
-      Flags behave like /etl.
+[green]/mcp add -n <name> -c "<cmd> [args]" [--env KEY=VAL,KEY2=VAL][/]
+[green]/mcp add-http -n <name> -u http://host:port[/]  Connect to an MCP HTTP façade.
+[green]/mcp list[/], [green]/mcp default <name>[/], [green]/mcp tools [<name>][/], [green]/mcp call <tool> '<JSON>'[/], [green]/mcp remove <name>[/]
 
-  [green]/where <path>[/]
-      Show how a local path resolves inside the container and whether it exists.
+[green]/rag ingest [-p PATH] [--glob "*.md,*.txt"][/]  Ingest files into memory (pgvector).
+[green]/rag add -t "text" [-s source] [-u uri][/]      Add an ad-hoc snippet to memory.
+[green]/rag show -q "query" [-k 6][/]                  Retrieve top-k chunks only (colored panels).
+[green]/rag ask  <question> [-k 6][/]                  Retrieve + LLM answer from context only.
 
-  [yellow]exit()[/]
-      Quit the REPL.
+[yellow]exit()[/]  Quit the REPL.
 
 [bold]Transform DSL[/]
-  Chain operations with semicolons. Works for CSV columns and JSON keys.
-  • [bold]reorder:[/bold][white]colA,colB,colC[/white]
-      Reorder columns; unspecified columns are appended in original order.
-  • [bold]rename:[/bold][white]old1->new1,old2->new2[/white]
-      Rename fields/columns. Quote names with spaces or numeric keys:
-      [white]rename:'1958'->y1958,'unit price'->price[/white]
-
-[green]/mcp add -n <name> -c "<command>" [--env KEY=VAL,KEY2=VAL][/]
-  Start an MCP stdio server and register it.
-  [green]/mcp list[/]                         — list connected MCP servers
-  [green]/mcp default <name>[/]               — set default server
-  [green]/mcp tools [<name>][/]               — list tools exposed by a server
-  [green]/mcp call <tool> '<json>'[/]         — call a tool on the default server
-  [green]/mcp call <name> <tool> '<json>'[/]  — call a tool on a specific server
-  [green]/mcp remove <name>[/]                — disconnect & remove a server
-  [green] /mcp add-http -n <name> -u http://host:port
-      Connect to an MCP HTTP façade.
-
+Chain operations with semicolons. Works for CSV columns and JSON keys.
+• [bold]reorder:[/bold][white]colA,colB,colC[/white]  Reorder columns; unspecified columns are appended in original order.
+• [bold]rename:[/bold][white]old1->new1,old2->new2[/white]  Rename fields/columns. Quote names with spaces or numeric keys: [white]rename:'1958'->y1958,'unit price'->price[/white]
 
 [bold]Color legend (verbose on)[/]
-  [bright_black]Step[/]           — agent loop step
-  [cyan]MODEL[/]                  — raw model output (truncated)
-  [yellow]TOOL CALL[/]            — which tool was invoked
-  [green]TOOL RESULT[/]           — preview of the tool output
-  [magenta]SUMMARY (search/etl)[/]— LLM summaries of search/ETL
-  [red]ERROR[/]                   — errors
-  [white]FINAL[/]                 — agent’s final answer
+[bright_black]Step[/] — agent loop step
+[cyan]MODEL[/] — raw model output (truncated)
+[yellow]TOOL CALL[/] — which tool was invoked
+[green]TOOL RESULT[/] — preview of the tool output
+[magenta]SUMMARY (search/etl)[/] — LLM summaries of search/ETL
+[red]ERROR[/] — errors
+[white]FINAL[/] — agent’s final answer
 
 [bold]Keyboard shortcuts[/]
-  Up/Down                      — navigate history (filtered)
-  Tab                          — completion (commands, paths for -p/-l)
-  Ctrl-R                       — reverse history search
-  Ctrl-A / Ctrl-E              — start/end of line
-  Alt-B / Alt-F                — move by word
-  Ctrl-U / Ctrl-K / Ctrl-W     — kill to start / kill to end / delete previous word
-  Ctrl-Y                       — yank (paste)
-  Ctrl-L                       — clear screen
-  Ctrl-C                       — cancel current line
-  Ctrl-D                       — exit on empty line
+Up/Down — navigate history (filtered)
+Tab — completion (commands, paths for -p/-l)
+Ctrl-R — reverse history search
+Ctrl-A / Ctrl-E — start/end of line
+Alt-B / Alt-F — move by word
+Ctrl-U / Ctrl-K — kill to start / kill to end
+Ctrl-W — delete previous word
+Ctrl-Y — yank (paste)
+Ctrl-L — clear screen
+Ctrl-C — cancel current line
+Ctrl-D — exit on empty line
 
 [bold]Notes[/]
-  • Start quiet with CLI flag: [white]--no-verbose[/white] (e.g., [white]docker compose run --rm app --no-verbose[/white]).
-  • Local files live under your repo and are mounted at [white]/app[/white] and [white]/app/data[/white].
+• Start quiet with CLI flag: [white]--no-verbose[/white] (e.g., [white]docker compose run --rm app --no-verbose[/white]).
+• Local files live under your repo and are mounted at [white]/app[/white] and [white]/app/data[/white].
 """
 
 
@@ -168,6 +161,7 @@ def _emit_factory(verbose: bool):
             console.print(f"[red]ERROR[/]: {payload}")
         elif kind == "final":
             console.print(f"[bold white]FINAL[/]: {payload}")
+
     return emit
 
 
@@ -322,7 +316,6 @@ async def _run_flagged_etl(path_or_url: str, transform_str: str, out_path: str |
         if not stype:
             console.print("[red]Source must end with .csv or .json[/]")
             return
-
         in_path = path_or_url
         final_out = out_path or _default_outpath(in_path)
 
@@ -351,16 +344,13 @@ async def _run_flagged_etl(path_or_url: str, transform_str: str, out_path: str |
 
         # 3) summarize via LLM
         summary = await llm.summarize_etl({"load": load_res, "transform": tr_res})
-
         console.print(
             f"[green]Saved:[/] {tr_res.get('saved_as') or final_out}")
         console.print(f"[magenta]SUMMARY (etl)[/]: {summary}")
-
     except FileNotFoundError as e:
         console.print(f"[red]File not found:[/] {e}")
         console.print(
-            "[bright_black]Tip: place files in repo ./data/ (mounted to /app/data) and use: /etl -p ./data/your.csv -t \"...\"[/]"
-        )
+            "[bright_black]Tip: place files in repo ./data/ (mounted to /app/data) and use: /etl -p ./data/your.csv -t \"...\"[/]")
     except Exception as e:
         console.print(f"[red]ETL error:[/] {type(e).__name__}: {e}")
 
@@ -369,11 +359,13 @@ def _make_key_bindings():
     kb = KeyBindings()
 
     @kb.add("c-c")
-    def _(event):  # cancel line
+    def _(event):
+        # cancel line
         event.app.current_buffer.reset()
 
     @kb.add("c-d")
-    def _(event):  # exit on empty, else delete
+    def _(event):
+        # exit on empty, else delete
         buf = event.app.current_buffer
         if not buf.text:
             event.app.exit(result="exit()")
@@ -381,7 +373,8 @@ def _make_key_bindings():
             buf.delete(1)
 
     @kb.add("c-l")
-    def _(event):  # clear
+    def _(event):
+        # clear
         event.app.renderer.clear()
 
     return kb
@@ -389,8 +382,10 @@ def _make_key_bindings():
 
 class AgentCompleter(Completer):
     def __init__(self):
-        self.commands = ["/research", "/etl", "/etl_from_source",
-                         "/where", "/help", "/mcp", "exit()"]
+        self.commands = [
+            "/research", "/etl", "/etl_from_source", "/where",
+            "/mcp", "/rag", "/help", "exit()"
+        ]
         self.path_completer = PathCompleter(expanduser=True)
 
     def get_completions(self, document: Document, complete_event):
@@ -407,9 +402,9 @@ class AgentCompleter(Completer):
 
         tokens = stripped.split()
         last = tokens[-1] if tokens else ""
-
         want_path = False
         frag = ""
+
         if last in ("-p", "-l"):
             want_path = True
             frag = ""
@@ -430,268 +425,403 @@ def _run_once(query: str, verbose: bool):
     console.print(ans)
     console.rule()
 
+
+# ---------- RAG: inline helpers for REPL ----------
+KB_DEFAULT = os.getenv("KB_PATH", "/knowledge")
+DEFAULT_PATTERNS = ("**/*.md", "**/*.txt")
+CHUNK_WORDS = 800
+OVERLAP_WORDS = 150
+
+
+def _read_files(root: Path, patterns: Iterable[str]) -> List[Tuple[Path, str]]:
+    out: List[Tuple[Path, str]] = []
+    for pat in patterns:
+        for p in root.rglob(pat):
+            if p.is_file():
+                try:
+                    out.append((p, p.read_text(encoding="utf-8")))
+                except Exception:
+                    pass
+    return out
+
+
+def _chunk_words(text: str, n: int = CHUNK_WORDS, overlap: int = OVERLAP_WORDS) -> List[str]:
+    words = text.split()
+    if not words:
+        return []
+    chunks, i = [], 0
+    while i < len(words):
+        chunk = " ".join(words[i:i + n]).strip()
+        if chunk:
+            chunks.append(chunk)
+        if i + n >= len(words):
+            break
+        i += n - overlap
+    return chunks
+
+
+def _highlight_terms(text: str, terms: List[str]) -> Text:
+    t = Text(text)
+    for term in terms:
+        if term:
+            t.highlight_words([term], style="yellow bold")
+    return t
+
+
+def _render_hits(hits: List[Dict], query: str, title: str = "RETRIEVAL") -> None:
+    terms = [w.strip(",.?:;! ").lower() for w in query.split() if len(w) > 2]
+    panels = []
+    for i, h in enumerate(hits, start=1):
+        head = Text(f"#{i}  ", style="bold green")
+        head.append(f"{h.get('source') or 'doc'}  ", style="cyan")
+
+        score = h.get("score")
+        if isinstance(score, (int, float)) and score > 0:
+            head.append(f"(score {score:.3f}) ", style="dim")
+
+        if h.get("uri"):
+            head.append(f"{h['uri']}", style="magenta")
+
+        body = _highlight_terms(h.get("text", ""), terms)
+        group = Group(head, Text("─" * 40, style="dim"), body)
+        panels.append(Panel(group, box=box.ROUNDED))
+    console.print(Panel(Group(*panels), title=title, border_style="green"))
+
+
+async def _rag_ingest_dir(path: str, patterns: Iterable[str]) -> Dict[str, int]:
+    mem = get_memory()
+    files = _read_files(Path(path).resolve(), patterns)
+    total_chunks = 0
+    for fpath, text in files:
+        chunks = _chunk_words(text)
+        for idx, chunk in enumerate(chunks):
+            meta = {"chunk": idx + 1, "chunks": len(chunks)}
+            await mem.aadd(content=chunk, source=fpath.name, uri=str(fpath), meta=meta)
+            total_chunks += 1
+    return {"files": len(files), "chunks": total_chunks}
+
+
+async def _rag_add_text(text: str, source: str, uri: str) -> None:
+    mem = get_memory()
+    await mem.aadd(content=text, source=source, uri=uri, meta={})
+
+
+async def _rag_retrieve(query: str, k: int) -> List[Dict]:
+    mem = get_memory()
+    hits = await mem.aquery(query, k=k)
+    out = []
+    for h in hits:
+        # pg_store returns dicts with the following keys
+        out.append({
+            "score": h.get("score"),
+            "source": h.get("source"),
+            "uri": h.get("uri"),
+            "text": h.get("content"),
+            "meta": h.get("meta"),
+        })
+    return out
+
+
+async def _rag_ask(question: str, k: int) -> Dict[str, object]:
+    hits = await _rag_retrieve(question, k=k)
+    context = "\n\n---\n\n".join(
+        f"[{h['source'] or 'doc'}] {h['text']}" for h in hits)
+
+    # Use your existing LLM client (llm.chat) which expects Message objects. :contentReference[oaicite:1]{index=1}
+    system = "You are a precise assistant. Answer ONLY from CONTEXT. If not in CONTEXT, reply 'I don't know.'"
+    user = f"QUESTION:\n{question}\n\nCONTEXT:\n{context}"
+    msgs = [Message(role="system", content=system),
+            Message(role="user", content=user)]
+    try:
+        answer = await llm.chat(msgs, temperature=0.0)
+    except Exception as e:
+        answer = f"(chat error: {type(e).__name__}: {e})"
+
+    return {"answer": answer, "hits": hits}
+
+
 # ---------- public API ----------
-
-
 def run_task(query: str, verbose: bool = True) -> None:
     _run_once(query, verbose)
 
 
 def run_repl(verbose: bool = True) -> None:
-    console.print("[bold]Agent REPL[/] — type [green]/research ...[/], [green]/etl ...[/], [green]/etl_from_source ...[/]. Type [yellow]/help[/] or [yellow]exit()[/].")
+    console.print(
+        "[bold]Agent REPL[/] — type "
+        "[green]/research ...[/], [green]/etl ...[/], [green]/etl_from_source ...[/], "
+        "[green]/rag ...[/], [green]/mcp ...[/].  Type [green]/help[/] for details."
+    )
 
-    # ensure history dir
-    hist_dir = "/app/.data"
-    try:
-        os.makedirs(hist_dir, exist_ok=True)
-    except Exception:
-        pass
-    history_path = os.path.join(hist_dir, ".agent_history")
-
+    hist_path = os.path.expanduser("~/.py_basic_agent_history")
     session = PromptSession(
-        message=">> ",
-        history=FileHistory(history_path),
+        history=FileHistory(hist_path),
         auto_suggest=AutoSuggestFromHistory(),
         completer=AgentCompleter(),
         key_bindings=_make_key_bindings(),
     )
 
-    # start background loop early so MCP clients bind to it
-    _ensure_bg_loop()
+    while True:
+        try:
+            line = session.prompt("> ")
+        except (EOFError, KeyboardInterrupt):
+            line = "exit()"
 
-    try:
-        while True:
-            try:
-                line = session.prompt(enable_history_search=True)
-            except EOFError:
-                console.print("\n[bold]bye![/]")
-                break
-            except KeyboardInterrupt:
-                console.print("[bright_black](cancelled)[/]")
-                continue
+        line = (line or "").strip()
+        if not line:
+            continue
+        if line == "exit()":
+            break
 
-            if not line:
-                continue
+        # ----- Commands -----
+        if line == "/help":
+            console.print(_help_text())
+            continue
 
-            s = line.strip()
-            if s == "exit()":
-                console.print("[bold]bye![/]")
-                break
+        if line.startswith("/where "):
+            _, p = line.split(" ", 1)
+            rp = os.path.realpath(p)
+            exists = os.path.exists(rp)
+            console.print(f"path: {rp}  exists: {exists}")
+            continue
 
-            if s == "/help":
-                console.print(_help_text())
-                continue
+        if line.startswith("/research "):
+            _, q = line.split(" ", 1)
+            run_task(q, verbose=verbose)
+            continue
 
-            if s.startswith("/research "):
-                query = s[len("/research "):].strip()
-                _run_once(query, verbose)
-                continue
-
-            if s.startswith("/where "):
-                target = s[len("/where "):].strip()
-                from .tools import _resolve_local_path
-                resolved = _resolve_local_path(target)
-                exists = os.path.exists(resolved)
-                status = "[green]exists[/green]" if exists else "[red]missing[/red]"
+        if line.startswith("/etl "):
+            _, flags = line.split(" ", 1)
+            f = _parse_flag_line(flags)
+            if not (f["p"] and f["t"]):
                 console.print(
-                    f"[white]/where[/white] {target} -> {resolved}  {status}")
-                continue
+                    "[red]/etl requires -p <path> and -t \"<transform>\"[/]")
+            else:
+                asyncio.run(_run_flagged_etl(f["p"], f["t"], f["l"], verbose))
+            continue
 
-            if s.startswith("/etl "):
-                flags = _parse_flag_line(s[len("/etl "):])
-                if not flags["p"] or not flags["t"]:
-                    console.print(
-                        "[red]/etl requires -p <path> and -t \"<transform>\"[/]")
-                    continue
-                asyncio.run(_run_flagged_etl(
-                    flags["p"], flags["t"], flags["l"], verbose))
-                continue
+        if line.startswith("/etl_from_source "):
+            _, flags = line.split(" ", 1)
+            f = _parse_flag_line(flags)
+            if not (f["p"] and f["t"]):
+                console.print(
+                    "[red]/etl_from_source requires -p <url> and -t \"<transform>\"[/]")
+            else:
+                asyncio.run(_run_flagged_etl(f["p"], f["t"], f["l"], verbose))
+            continue
 
-            if s.startswith("/etl_from_source "):
-                flags = _parse_flag_line(s[len("/etl_from_source "):])
-                if not flags["p"] or not flags["t"]:
-                    console.print(
-                        "[red]/etl_from_source requires -p <url> and -t \"<transform>\"[/]")
-                    continue
-                asyncio.run(_run_flagged_etl(
-                    flags["p"], flags["t"], flags["l"], verbose))
-                continue
+        if line.startswith("/mcp "):
+            # subcommands: add, add-http, list, default, tools, call, remove
+            parts = shlex.split(line)
+            sub = parts[1] if len(parts) > 1 else None
 
-            # ---------- MCP commands (use persistent loop) ----------
-            if s.startswith("/mcp"):
-                args = s[len("/mcp"):].strip()
-                if args == "" or args == "help":
-                    console.print("""[bold]MCP commands[/]
-    [green]/mcp add-http -n <name> -u http://host:port[/]   Connect to HTTP MCP façade
-    [green]/mcp add -n <name> -c "<command>" [--env K=V,...][/]  Launch stdio MCP server (requires MCP stdio client in app)
-    [green]/mcp list[/]                 List connected servers (default marked)
-    [green]/mcp default <name>[/]       Set default server
-    [green]/mcp tools [<name>][/]       List tools on server
-    [green]/mcp call <tool> '{json}'[/] Call tool on default server
-    [green]/mcp call <name> <tool> '{json}'[/]  Call tool on specific server
-    [green]/mcp ping [<name>][/]        Quick connectivity check
-    [green]/mcp remove <name>[/]        Disconnect & remove
-    """)
-                    continue
-
-                # add-http
-                if args.startswith("add-http "):
-                    if not HAS_MCP_HTTP:
+            try:
+                if sub == "add-http":
+                    rest = line.split(" ", 2)[2] if len(parts) >= 3 else ""
+                    opts = _parse_mcp_add_http_flags(rest)
+                    if not (opts["n"] and opts["u"]):
                         console.print(
-                            "[red]HTTP MCP client requires `httpx`. Add `httpx>=0.24` to requirements.txt and rebuild.[/]")
-                        continue
-                    flags = _parse_mcp_add_http_flags(args[len("add-http "):])
-                    if not flags["n"] or not flags["u"]:
+                            "[red]/mcp add-http -n <name> -u http://host:port[/]")
+                    else:
+                        _run_async(mcp_manager.add_http(opts["n"], opts["u"]))
                         console.print(
-                            "[red]Usage:[/] /mcp add-http -n <name> -u http://host:port")
-                        continue
-                    try:
-                        _run_async(mcp_manager.add_http(
-                            flags["n"], flags["u"]))
-                        console.print(
-                            f"[green]MCP HTTP server '{flags['n']}' connected at {flags['u']}.[/]")
-                    except Exception as e:
-                        console.print(
-                            f"[red]MCP add-http error:[/] {type(e).__name__}: {e}")
-                    continue
-
-                # add (stdio)
-                if args.startswith("add "):
+                            f"[green]HTTP MCP added:[/] {opts['n']} → {opts['u']}")
+                elif sub == "add":
                     if not HAS_MCP_STDIO:
                         console.print(
-                            "[red]MCP stdio client not installed. Use `/mcp add-http ...` or add a stdio MCP client lib to requirements.[/]")
-                        continue
-                    flags = _parse_mcp_add_stdio_flags(args[len("add "):])
-                    if not flags["n"] or not flags["c"]:
-                        console.print(
-                            "[red]Usage:[/] /mcp add -n <name> -c \"<command>\" [--env KEY=VAL,KEY2=VAL]")
-                        continue
-                    envd = _parse_env_csv(flags["env"])
-                    try:
-                        _run_async(mcp_manager.add_stdio(
-                            flags["n"], flags["c"], envd))
-                        console.print(
-                            f"[green]MCP stdio server '{flags['n']}' launched.[/]")
-                    except Exception as e:
-                        console.print(
-                            f"[red]MCP add error:[/] {type(e).__name__}: {e}")
-                    continue
-
-                # list servers
-                if args == "list":
-                    names = mcp_manager.list_servers()
-                    if not names:
-                        console.print(
-                            "[bright_black](no MCP servers)[/]  Try: /mcp add-http -n fs -u http://host.docker.internal:8765")
+                            "[red]MCP stdio client not included in this build.[/]")
                     else:
-                        default = mcp_manager.default_name
-                        for n in names:
-                            star = " *default*" if n == default else ""
-                            console.print(f"- {n}{star}")
-                    continue
-
-                # set default
-                if args.startswith("default "):
-                    name = args.split(maxsplit=1)[1].strip()
-                    try:
-                        mcp_manager.set_default(name)
-                        console.print(
-                            f"[green]Default MCP server set to[/] {name}")
-                    except Exception as e:
-                        console.print(f"[red]MCP default error:[/] {e}")
-                    continue
-
-                # tools
-                if args.startswith("tools"):
-                    parts = args.split(maxsplit=1)
-                    name = parts[1].strip() if len(parts) > 1 else None
-                    try:
-                        tl_raw = _run_async(mcp_manager.list_tools(name))
-                        tools_list = _only_tools_list(tl_raw)
-                        if not tools_list:
+                        rest = line.split(" ", 2)[2] if len(parts) >= 3 else ""
+                        opts = _parse_mcp_add_stdio_flags(rest)
+                        if not (opts["n"] and opts["c"]):
                             console.print(
-                                "[bright_black](no tools reported)[/]")
+                                "[red]/mcp add -n <name> -c \"command ...\" [--env K=V,...][/]")
                         else:
-                            for t in tools_list:
-                                nm = t.get("name", "?")
-                                desc = t.get("description", "")
-                                console.print(
-                                    f"- [white]{nm}[/white] — {desc}", highlight=False)
-                    except Exception as e:
-                        console.print(
-                            f"[red]MCP tools error:[/] {type(e).__name__}: {e}")
-                    continue
-
-                # ping (count only tools array)
-                if args.startswith("ping"):
-                    parts = args.split(maxsplit=1)
-                    name = parts[1].strip() if len(parts) > 1 else None
-                    try:
-                        tl_raw = _run_async(mcp_manager.list_tools(name))
-                        tools_list = _only_tools_list(tl_raw)
-                        n = len(tools_list)
-                        label = name or mcp_manager.default_name or "(default)"
-                        console.print(
-                            f"[green]OK[/] — {n} tool(s) available on {label}")
-                    except Exception as e:
-                        console.print(
-                            f"[red]Ping failed:[/] {type(e).__name__}: {e}")
-                    continue
-
-                # call
-                if args.startswith("call "):
-                    try:
-                        parts = shlex.split(args)  # ["call", ...]
-                    except Exception as e:
-                        console.print(f"[red]Parse error:[/] {e}")
-                        continue
-                    parts = parts[1:]
-                    server = None
-                    tool = None
-                    payload = None
-                    if len(parts) == 2:
-                        tool, payload = parts
-                    elif len(parts) >= 3:
-                        server, tool, payload = parts[0], parts[1], " ".join(
-                            parts[2:])
+                            env = _parse_env_csv(opts.get("env"))
+                            _run_async(mcp_manager.add_stdio(
+                                opts["n"], opts["c"], env))
+                            console.print(
+                                f"[green]STDIO MCP added:[/] {opts['n']}")
+                elif sub == "list":
+                    names = _run_async(mcp_manager.list_servers())
+                    console.print("servers: " + ", ".join(names)
+                                  if names else "(none)")
+                elif sub == "default":
+                    name = parts[2] if len(parts) > 2 else None
+                    if not name:
+                        console.print("[red]/mcp default <name>[/]")
                     else:
+                        _run_async(mcp_manager.set_default(name))
+                        console.print(f"default server: {name}")
+                elif sub == "tools":
+                    name = parts[2] if len(parts) > 2 else None
+                    tools_list = _run_async(mcp_manager.list_tools(name))
+                    only = _only_tools_list(tools_list)
+                    if not only:
+                        console.print("(no tools)")
+                    else:
+                        for t in only:
+                            console.print(
+                                f"- {t.get('name')} — {t.get('description')}")
+                elif sub == "call":
+                    if len(parts) < 4:
                         console.print(
-                            "[red]Usage:[/] /mcp call <tool> '{json}'  OR  /mcp call <server> <tool> '{json}'")
-                        continue
-                    try:
-                        args_obj = json.loads(payload)
-                    except Exception as e:
-                        console.print(f"[red]Bad JSON:[/] {e}")
-                        continue
-                    try:
-                        res = _run_async(mcp_manager.call(
-                            tool, args_obj, server))
-                        console.print("[green]MCP result:[/]")
-                        console.print(json.dumps(
-                            res, indent=2, ensure_ascii=False), highlight=False)
-                    except Exception as e:
-                        console.print(
-                            f"[red]MCP call error:[/] {type(e).__name__}: {e}")
-                    continue
+                            "[red]/mcp call <server|-> <tool> '<JSON>'[/]")
+                    else:
+                        server = None if parts[2] == "-" else parts[2]
+                        tool = parts[3]
+                        args_json = " ".join(parts[4:]) if len(
+                            parts) > 4 else "{}"
+                        try:
+                            args = json.loads(args_json)
+                        except Exception as e:
+                            console.print(f"[red]Invalid JSON:[/] {e}")
+                            continue
+                        resp = _run_async(mcp_manager.call(
+                            tool, args, server_name=server))
+                        console.print(json.dumps(resp, indent=2))
+                elif sub == "remove":
+                    if len(parts) < 3:
+                        console.print("[red]/mcp remove <name>[/]")
+                    else:
+                        _run_async(mcp_manager.remove(parts[2]))
+                        console.print(f"removed: {parts[2]}")
+                else:
+                    console.print("[red]Unknown /mcp subcommand[/]")
+            except Exception as e:
+                console.print(f"[red]MCP error:[/] {type(e).__name__}: {e}")
+            continue
 
-                # remove
-                if args.startswith("remove "):
-                    name = args.split(maxsplit=1)[1].strip()
-                    try:
-                        _run_async(mcp_manager.remove(name))
-                        console.print(
-                            f"[green]MCP server '{name}' removed.[/]")
-                    except Exception as e:
-                        console.print(f"[red]MCP remove error:[/] {e}")
-                    continue
-
-                # unknown subcommand
+        if line.startswith("/rag "):
+            # split only once to avoid shlex on entire line (apostrophe-safe)
+            try:
+                _, rest = line.split(" ", 1)
+            except ValueError:
                 console.print(
-                    "[yellow]Unknown MCP command.[/]\nTry: /mcp help")
+                    "[bold cyan]/rag subcommands:[/] ingest | add | show | ask")
                 continue
 
-            # Fallback: run a one-shot research
-            _run_once(s, verbose)
+            sub, rest_args = (rest.split(" ", 1) + [""])[:2]
 
-    finally:
-        _shutdown_bg_loop()
+            if sub == "ingest":
+                # /rag ingest [-p PATH] [--glob "*.md,*.txt"]
+                try:
+                    args = shlex.split(rest_args)
+                except ValueError:
+                    # fall back gracefully if quoting is odd
+                    args = rest_args.split()
+                path = KB_DEFAULT
+                patterns = DEFAULT_PATTERNS
+                i = 0
+                while i < len(args):
+                    if args[i] in ("-p", "--path") and i + 1 < len(args):
+                        path = args[i + 1]
+                        i += 2
+                    elif args[i] == "--glob" and i + 1 < len(args):
+                        patterns = tuple(x.strip()
+                                         for x in args[i + 1].split(",") if x.strip())
+                        i += 2
+                    else:
+                        i += 1
+                res = asyncio.run(_rag_ingest_dir(path, patterns))
+                console.print(Panel(
+                    f"INGEST DONE: files={res['files']} chunks={res['chunks']}", border_style="green"))
+                continue
+
+            if sub == "add":
+                # /rag add -t "text" [-s source] [-u uri]
+                try:
+                    args = shlex.split(rest_args)
+                except ValueError:
+                    args = rest_args.split()
+                text = None
+                source = "adhoc"
+                uri = "mem://adhoc"
+                i = 0
+                while i < len(args):
+                    if args[i] in ("-t", "--text") and i + 1 < len(args):
+                        text = args[i + 1]
+                        i += 2
+                    elif args[i] in ("-s", "--source") and i + 1 < len(args):
+                        source = args[i + 1]
+                        i += 2
+                    elif args[i] in ("-u", "--uri") and i + 1 < len(args):
+                        uri = args[i + 1]
+                        i += 2
+                    else:
+                        i += 1
+                if not text:
+                    console.print("[bold red]Missing -t/--text[/]")
+                else:
+                    asyncio.run(_rag_add_text(text, source, uri))
+                    console.print(Panel("ADDED ✓", border_style="green"))
+                continue
+
+            if sub == "show":
+                # /rag show -q "query" [-k 6]
+                try:
+                    args = shlex.split(rest_args)
+                except ValueError:
+                    args = rest_args.split()
+                query = None
+                k = 6
+                i = 0
+                while i < len(args):
+                    if args[i] in ("-q", "--query") and i + 1 < len(args):
+                        query = args[i + 1]
+                        i += 2
+                    elif args[i] in ("-k", "--k") and i + 1 < len(args):
+                        try:
+                            k = int(args[i + 1])
+                        except Exception:
+                            pass
+                        i += 2
+                    else:
+                        i += 1
+                if not query:
+                    console.print("[bold red]Missing -q/--query[/]")
+                else:
+                    hits = asyncio.run(_rag_retrieve(query, k))
+                    _render_hits(hits, query, title=f"RETRIEVAL k={k}")
+                continue
+
+            if sub == "ask":
+                # /rag ask <question> [-k N]
+                # Grab optional trailing "-k N" without running shlex over apostrophes in the question.
+                m = re.search(r"(?:^|\s)-k\s+(\d+)\s*$", rest_args)
+                if m:
+                    try:
+                        k = int(m.group(1))
+                    except Exception:
+                        k = 6
+                    question = rest_args[:m.start()].strip()
+                else:
+                    k = 6
+                    question = rest_args.strip()
+
+                # Strip surrounding quotes if the whole question is quoted
+                if len(question) >= 2 and question[0] == question[-1] and question[0] in ("'", '"'):
+                    question = question[1:-1]
+
+                if not question:
+                    console.print(
+                        "[bold red]Usage:[/] /rag ask <question> [-k 6]")
+                else:
+                    res = asyncio.run(_rag_ask(question, k))
+                    _render_hits(res["hits"], question,
+                                 title=f"RETRIEVAL for: {question}")
+                    console.print(
+                        Panel(Text(str(res["answer"])), title="ANSWER", border_style="cyan"))
+                continue
+
+            console.print(
+                "[bold cyan]/rag subcommands:[/] ingest | add | show | ask")
+            continue
+
+    _shutdown_bg_loop()
+
+
+if __name__ == "__main__":
+    verbose = True
+    if "--no-verbose" in sys.argv:
+        verbose = False
+    run_repl(verbose=verbose)

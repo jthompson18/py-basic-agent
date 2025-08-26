@@ -2,13 +2,13 @@
 
 A tiny but real agentic system you can run locally. It uses:
 
-* an LLM (via **Ollama**) for reasoning and tool selection
-* **pgvector** for long-term memory (document embeddings in Postgres)
-* a **Rich** + **prompt\_toolkit** REPL for a pleasant CLI
-* optional **MCP** (Model Context Protocol) tools (HTTP façade) for file I/O
-* a minimal **ETL** pipeline (CSV/JSON → transform → save), plus simple web **search/fetch** tools
+* an LLM (via Ollama) for reasoning and tool selection
+* pgvector for long‑term memory (document embeddings in Postgres)
+* a Rich + prompt\_toolkit REPL for a pleasant CLI
+* optional MCP (Model Context Protocol) tools (HTTP façade) for file I/O
+* a minimal ETL pipeline (CSV/JSON → transform → save), plus simple web search/fetch tools
 
-This repo is intentionally small and readable—ideal for learning how agent loops, tool calls, memory, and LLMs work together.
+> RAG support: The REPL now includes a small Retrieval‑Augmented Generation flow. See [RAG (Retrieval‑Augmented Generation)](#rag-retrievalaugmented-generation) below.
 
 ---
 
@@ -22,8 +22,9 @@ This repo is intentionally small and readable—ideal for learning how agent loo
 * [Reset after embedding update](#reset-after-embedding-update)
 * [How it works (core concepts)](#how-it-works-core-concepts)
 * [Using the REPL](#using-the-repl)
-* [ETL mini-DSL](#etl-mini-dsl)
+* [ETL mini‑DSL](#etl-mini-dsl)
 * [MCP (Model Context Protocol) tools](#mcp-model-context-protocol-tools)
+* [RAG (Retrieval‑Augmented Generation)](#rag-retrievalaugmented-generation)
 * [Troubleshooting](#troubleshooting)
 * [Project layout](#project-layout)
 
@@ -31,7 +32,7 @@ This repo is intentionally small and readable—ideal for learning how agent loo
 
 ## Quick start
 
-> Before you start: make sure **Ollama is running and reachable**. See [Ollama hosting](#ollama-hosting) for OS-specific setup (macOS runs Ollama outside Docker; Linux/Windows may use the optional `ollama` service).
+> Before you start: make sure Ollama is running and reachable. See **Ollama hosting** for OS‑specific setup (macOS runs Ollama outside Docker; Linux/Windows may use the optional `ollama` service).
 
 ```bash
 # 1) Start dependencies (DB + optional MCP file server)
@@ -43,7 +44,7 @@ docker compose run --rm app
 
 In the REPL:
 
-```
+```text
 /research Who founded NVIDIA and when?
 /etl -p ./data/sales_orders.csv -t "reorder:date,region,product,units,unit_price; rename:unit_price->price; limit:3"
 /mcp add-http -n fs -u http://host.docker.internal:8765
@@ -53,16 +54,23 @@ In the REPL:
 
 Type `/help` for a full list of commands, or `exit()` to quit.
 
+> **RAG quick taste**:
+>
+> ```
+> /rag ingest -p ./knowledge
+> /rag show -q "quartz-8127" -k 3
+> /rag ask What is the RAG demo code?
+> ```
+
 ---
 
 ## Requirements
 
 You don’t need Python locally. Everything runs in containers.
 
-* **Docker** Desktop or Engine (compose v2)
-* **Ollama** running on your host (for the LLM + embeddings)
+* Docker Desktop or Engine (compose v2)
+* Ollama running on your host (for the LLM + embeddings)
 
-  * [https://ollama.com/](https://ollama.com/)
   * pull models you’ll use:
 
     ```bash
@@ -84,7 +92,7 @@ cd py-basic-agent
 cp .env.example .env
 ```
 
-Update values as needed (see [Environment variables](#environment-variables)).
+Update values as needed (see **Environment variables**).
 
 ### 2) Start Postgres (pgvector) and MCP file server
 
@@ -92,7 +100,7 @@ Update values as needed (see [Environment variables](#environment-variables)).
 docker compose up -d pgvector mcpfs
 ```
 
-> The pgvector container auto-creates the database, role, and tables via the mounted `db/schema.sql`. No manual DB bootstrapping needed.
+> The pgvector container auto‑creates the database, role, and tables via the mounted `db/schema.sql`. No manual DB bootstrapping needed.
 
 ### 3) Run the REPL
 
@@ -100,146 +108,119 @@ docker compose up -d pgvector mcpfs
 docker compose run --rm app
 ```
 
-### OS Notes
+### (Optional) Prepare a knowledge folder for RAG
 
-* **macOS**: Works out of the box. Docker Desktop provides `host.docker.internal`.
-* **Windows**:
+Create `knowledge/` with demo docs; you can use the included `intro.md` and `policies.md` examples.
 
-  * Use **Powershell**. Line-continuations use backtick `` ` `` instead of `\`.
-  * Ensure Docker Desktop is running.
-* **Linux**:
+```bash
+mkdir -p knowledge
+# these files may already exist in the repo
+# echo "# RAG Demo — py-basic-agent" > knowledge/intro.md
+# echo "# PII Handling & Redaction Policy (Demo)" > knowledge/policies.md
+```
 
-  * We already map `host.docker.internal` using Compose `extra_hosts`. If you use a non-Docker network, ensure your host’s Ollama is reachable (or set `OLLAMA_HOST` to a LAN IP).
+Mount it in compose (see **RAG** section) or use a repo‑relative path with `/rag ingest -p ./knowledge`.
 
 ---
 
 ## Ollama hosting
 
-**macOS (recommended):** run Ollama **outside** Docker (host app). This is required on macOS so the models can use Metal and to avoid Docker networking issues. Keep `OLLAMA_HOST=http://host.docker.internal:11434`.
+* **macOS (recommended)**: run Ollama outside Docker (host app). This is required on macOS so the models can use Metal and to avoid Docker networking issues. Keep `OLLAMA_HOST=http://host.docker.internal:11434`.
+* **Linux/Windows (optional in‑container)**: you may run Ollama as a container with Compose. When running the in‑container service, set `OLLAMA_HOST=http://ollama:11434`.
 
-**Linux/Windows (optional in-container):** you may run Ollama **as a container** with Compose. Open `docker-compose.yml` and **uncomment** the `ollama:` service block, then start it:
+> ⚠️ Experimental: the dockerized Ollama path depends on GPU drivers/permissions. If you hit timeouts or slow responses, prefer running Ollama on the host and use `host.docker.internal:11434`.
 
-```bash
-docker compose up -d ollama
-# (and usually alongside other deps)
-docker compose up -d pgvector mcpfs ollama
-```
-
-When running the in-container service, set in your `.env`:
-
-```
-OLLAMA_HOST=http://ollama:11434
-```
-
-> ⚠️ **Experimental**: the dockerized Ollama path is not 100% tested here and may be flaky depending on GPU drivers and container permissions. If you hit timeouts or slow responses, prefer running Ollama on the host and keep `OLLAMA_HOST` pointed at `host.docker.internal:11434`.
+---
 
 ## Environment variables
 
 All live in `.env`. Defaults are safe for local use.
 
-| Variable            | What it does                                                          | Example                                              |
-| ------------------- | --------------------------------------------------------------------- | ---------------------------------------------------- |
-| `OLLAMA_HOST`       | Base URL for Ollama. The app calls `/api/chat` and `/api/embeddings`. | `http://host.docker.internal:11434`                  |
-| `AGENT_LLM_MODEL`   | Chat model used by the agent.                                         | `llama3.1:8b`                                        |
-| `AGENT_TEMPERATURE` | LLM sampling temperature (float).                                     | `0.2`                                                |
-| `AGENT_MAX_STEPS`   | Agent loop max tool steps before giving up.                           | `8`                                                  |
-| `AGENT_DB_URL`      | Postgres URL used by `PgVectorMemory`. Provided by compose.           | `postgresql://agent:agentpass@pgvector:5432/agentdb` |
-| `AGENT_EMBED_MODEL` | Embedding model name in Ollama.                                       | `all-minilm`                                         |
-| `AGENT_EMBED_DIM`   | Embedding vector dimension. **Must match schema.sql**.                | `384`                                                |
-| `SERPER_API_KEY`    | API key for the Serper search tool (if enabled).                      | `sk-...`                                             |
-| `AGENT_VERBOSE`     | Controls extra logging in some contexts (`true/false`).               | `true`                                               |
+| Variable            | What it does                                                                                                        | Example                                              |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| `OLLAMA_HOST`       | Base URL for Ollama. The app calls `/api/chat` and `/api/embeddings`.                                               | `http://host.docker.internal:11434`                  |
+| `AGENT_LLM_MODEL`   | Chat model used by the agent.                                                                                       | `llama3.1:8b`                                        |
+| `AGENT_TEMPERATURE` | LLM sampling temperature (float).                                                                                   | `0.2`                                                |
+| `AGENT_MAX_STEPS`   | Agent loop max tool steps before giving up.                                                                         | `8`                                                  |
+| `AGENT_DB_URL`      | Postgres URL used by `PgVectorMemory`. Provided by compose.                                                         | `postgresql://agent:agentpass@pgvector:5432/agentdb` |
+| `AGENT_EMBED_MODEL` | Embedding model name in Ollama.                                                                                     | `all-minilm`                                         |
+| `AGENT_EMBED_DIM`   | Embedding vector dimension. Must match `schema.sql`.                                                                | `384`                                                |
+| `SERPER_API_KEY`    | API key for the Serper search tool (if enabled).                                                                    | `sk-…`                                               |
+| `AGENT_VERBOSE`     | Controls extra logging in some contexts (`true/false`).                                                             | `true`                                               |
+| **`KB_PATH`**       | Default folder for RAG ingestion **inside the container**. If you don’t mount it, use `/rag ingest -p ./knowledge`. | `/knowledge`                                         |
 
 ### Changing models
 
 * Use a different chat model: set `AGENT_LLM_MODEL` (e.g., `llama3.2:3b`).
-* Use a different embedding model:
+* Use a different embedding model: set `AGENT_EMBED_MODEL` and update `AGENT_EMBED_DIM`, then update the DB schema (vector size in `schema.sql`) and recreate DB or migrate:
 
-  * set `AGENT_EMBED_MODEL` **and**
-  * update `AGENT_EMBED_DIM`
-  * update the DB schema (vector size in `schema.sql`) and recreate DB **or** migrate:
-
-    ```sql
-    ALTER TABLE docs ALTER COLUMN embedding TYPE vector(<new_dim>);
-    ```
+```sql
+ALTER TABLE docs ALTER COLUMN embedding TYPE vector(<new_dim>);
+```
 
 ---
 
 ## Reset after embedding update
 
-If you change `AGENT_EMBED_MODEL` or `AGENT_EMBED_DIM`, you must ensure the database vector dimension matches the embedding dimension. Easiest path is to recreate the DB volume (it is auto-initialized from `db/schema.sql`).
+If you change `AGENT_EMBED_MODEL` or `AGENT_EMBED_DIM`, ensure the database vector dimension matches the embedding dimension. Easiest path is to recreate the DB volume (auto‑initialized from `db/schema.sql`).
 
-1. Edit `.env` to the new model & dim (defaults use `all-minilm`):
-
-   * `AGENT_EMBED_MODEL=all-minilm`
-   * `AGENT_EMBED_DIM=384`
-2. Edit `db/schema.sql` to match:
-
-   ```sql
-   -- docs table
-   embedding VECTOR(384)
-   ```
+1. Edit `.env` to the new model & dim (defaults use `all-minilm`).
+2. Edit `db/schema.sql` to match (e.g., `VECTOR(384)`).
 3. Drop and rebuild Postgres (recreates volume and schema):
 
-   ```bash
-   docker compose down -v
-   docker compose up -d pgvector
-   ```
+```bash
+docker compose down -v
+docker compose up -d pgvector
+```
+
 4. (Optional) verify the table shape:
 
-   ```bash
-   docker compose exec -T pgvector psql -X -U agent -d agentdb -c "\d+ docs"
-   ```
+```bash
+docker compose exec -T pgvector psql -X -U agent -d agentdb -c "\d+ docs"
+```
+
 5. Restart the REPL:
 
-   ```bash
-   docker compose run --rm app
-   ```
+```bash
+docker compose run --rm app
+```
 
-> Prefer a migration instead of dropping the volume? Run:
->
-> ```sql
-> ALTER TABLE docs ALTER COLUMN embedding TYPE vector(384);
-> ```
+> Prefer a migration instead of dropping the volume? Use the `ALTER TABLE … TYPE vector(<dim>)` command above.
+
+---
 
 ## How it works (core concepts)
 
 ### 1) The Agent loop (`agent/core.py`)
 
-* Builds a message list: a **system prompt** + **user task** + any **observations** from tools.
-
+* Builds a message list: a system prompt + user task + any observations from tools.
 * Calls the LLM with the messages.
-
-* The LLM responds with a **JSON tool call** or a **final answer**. Example:
-
-  ```json
-  {"tool":"search","input":{"query":"NVIDIA founders"}}
-  ```
-
+* The LLM responds with a JSON tool call or a final answer, e.g.: `{ "tool": "search", "input": {"query": "NVIDIA founders"} }`.
 * The agent executes the tool, captures an observation (and often a short LLM summary), appends that back to the conversation, and repeats until a final answer or the step limit is reached.
 
 ### 2) The LLM client (`agent/llm.py`)
 
-* Thin async wrapper around **Ollama**:
+* Thin async wrapper around Ollama APIs:
 
   * `/api/chat` for conversation
   * `/api/embeddings` for vectorization
 * Normalizes messages and enforces length limits.
-* Includes a **system prompt** that teaches the LLM to return JSON tool calls or a final JSON with a readable summary.
+* Includes a system prompt that teaches the LLM to return JSON tool calls or a final JSON with a readable summary.
 
 ### 3) Tools (`agent/tools.py`)
 
-* **Search**: Serper (or your stub). Returns top results.
-* **Fetch**: Gets a URL, returns `{title, url, text}`.
-* **ETL**: `load_csv/json` → `transform` (select/rename/limit) → `save`.
-* **Memory**: router that calls the configured memory implementation.
+* Search: Serper (or stub). Returns top results.
+* Fetch: Gets a URL, returns `{title, url, text}`.
+* ETL: `load_csv/json` → `transform` (select/rename/limit) → `save`.
+* Memory: router that calls the configured memory implementation.
 
-Each tool is **pure async** and returns structured data.
+Each tool is pure async and returns structured data.
 
 ### 4) Memory (`agent/memory/`)
 
 Two implementations (same interface):
 
-* `SimpleMemory` (in-process, substring search). Great for unit tests.
+* `SimpleMemory` (in‑process, substring search) — great for unit tests.
 * `PgVectorMemory` (Postgres + pgvector, cosine similarity):
 
   * `aupsert(docs)` store content + embeddings
@@ -247,7 +228,7 @@ Two implementations (same interface):
   * `aadd(text, source, uri, meta)` quick note
   * `adump(n)` latest notes dump (for system prompt context)
 
-**Embeddings** come from Ollama (`AGENT_EMBED_MODEL`), and the vector size must match DB schema.
+Embeddings come from Ollama (`AGENT_EMBED_MODEL`), and the vector size must match DB schema.
 
 ### 5) REPL (`agent/repl.py`)
 
@@ -259,8 +240,9 @@ Two implementations (same interface):
   * `/etl -p <path> -t "<transform>" [-l <out>]`
   * `/etl_from_source -p <url> -t "<transform>" [-l <out>]`
   * `/where <path>`
-  * `/mcp ...` (see below)
+  * `/mcp …` (see below)
   * `/help`, `exit()`
+  * **`/rag …` (see below)**
 
 ---
 
@@ -274,221 +256,156 @@ docker compose run --rm app
 
 Try research:
 
-```
+```text
 /research Compare NVIDIA vs AMD GPU market share over the last 2 years.
 ```
 
 Try ETL:
 
-```
+```text
 /etl -p ./data/sales_orders.csv -t "reorder:date,region,product,units,unit_price; rename:unit_price->price; limit:3"
 ```
 
 Check a path:
 
-```
+```text
 /where ./data/sales_orders.csv
-```
-
-### Examples (commands & expected output)
-
-> These are abridged. Exact wording may vary, but the flow (MODEL → TOOL CALL/RESULT → final answer) should look similar.
-
-**Research**
-
-```
-/research Who founded NVIDIA and when?
-```
-
-*Expected excerpt:*
-
-```
-Step 1/8
-MODEL: {"tool":"search","input":{"query":"NVIDIA founders"}}
-TOOL CALL: search {"query": "NVIDIA founders"}
-TOOL RESULT: search → (top links...)
-...
-Answer
-NVIDIA was founded in 1993 by Jensen Huang, Chris Malachowsky, and Curtis Priem.
-
-Sources:
-- Wikipedia — https://en.wikipedia.org/wiki/Nvidia
-- NVIDIA Corporate Timeline — https://www.nvidia.com/en-us/about-nvidia/corporate-timeline/
-```
-
-**ETL (local file)**
-
-```
-/etl -p ./data/sales_orders.csv -t "reorder:date,region,product,units,unit_price; rename:unit_price->price; limit:3" -l ./data/sales_orders.sample.parquet
-```
-
-*Expected excerpt:*
-
-```
-TOOL RESULT: etl → ETL DONE: saved ./data/sales_orders.sample.parquet (rows: 3)
-```
-
-**ETL from a URL**
-
-> Tip: Browse free CSV/JSON datasets at Data.gov’s catalog: [https://catalog.data.gov/dataset/](https://catalog.data.gov/dataset/) . Use a **direct** CSV/JSON file URL.
-
-```
-/etl_from_source -p https://people.sc.fsu.edu/~burkardt/data/csv/airtravel.csv \
-  -t "reorder:Month,1958,1959; rename:1958->y1958; limit:5" \
-  -l ./data/airtravel_top5.csv
-```
-
-*Expected excerpt:*
-
-```
-TOOL RESULT: etl → ETL DONE: saved ./data/airtravel_top5.csv (rows: 5)
-```
-
-**MCP file listing**
-
-```
-/mcp add-http -n fs -u http://host.docker.internal:8765
-/mcp call fs list_files '{"path":"./data"}'
-```
-
-*Expected excerpt:*
-
-```
-TOOL RESULT: mcp:fs:list_files → ["customers.json","sales_orders.csv", ...]
-```
-
-**Path helper**
-
-```
-/where ./data/customers.json
-```
-
-*Expected excerpt:*
-
-```
-Resolved: /app/data/customers.json (exists, ~2.4 KB)
 ```
 
 ---
 
-## ETL mini-DSL
+## ETL mini‑DSL
 
-> Tip: Need a URL for `/etl_from_source`? Browse open datasets at **Data.gov**: [https://catalog.data.gov/dataset/](https://catalog.data.gov/dataset/) — copy a **direct** CSV/JSON link.
+Chain operations with semicolons. Works for CSV columns and JSON keys.
 
-Transform spec (semicolon-chained):
-
-* `reorder: A,B,C` — selects & orders; missing columns are appended in original order
-* `rename: old->new, 'unit price'->price` — rename columns/keys
-* `limit: 100` — cap output rows (or JSON item count)
+* `reorder:colA,colB,colC` — Reorder columns; unspecified columns are appended in original order.
+* `rename:old1->new1,old2->new2` — Rename fields/columns. Quote names with spaces or numeric keys: `rename:'1958'->y1958,'unit price'->price`.
+* `limit:K` — Truncate rows/objects to K.
 
 Examples:
 
+```text
+/etl -p ./data/sales_orders.csv -t "reorder:date,region,product,units,unit_price; rename:unit_price->price; limit:3" -l ./data/sales_orders.sample.parquet
 ```
-reorder:date,region,product,units,unit_price; rename:unit_price->price; limit:3
-rename:'1958'->y1958,'unit price'->price
-```
-
-Output format is inferred from `-l` extension, or mirrors input if omitted.
 
 ---
 
 ## MCP (Model Context Protocol) tools
 
-An **HTTP façade** service exposes simple FS tools (list/read/write/stat). We include `mcpfs` in Compose.
+MCP lets you add external tools to the agent at runtime (HTTP façade or stdio servers).
 
-In the REPL:
+Examples:
 
-```
+```text
 /mcp add-http -n fs -u http://host.docker.internal:8765
 /mcp tools
 /mcp call fs list_files '{"path":"./data"}'
-/mcp call fs read_text '{"path":"./data/customers.json"}'
 ```
 
-* `mcp list` — show connected servers (marks the default)
-* `mcp default <name>` — set default server
-* `mcp ping [<name>]` — connectivity check (counts usable tool endpoints)
-* `mcp remove <name>` — disconnect
+---
+
+## RAG (Retrieval‑Augmented Generation)
+
+A small, readable RAG layer is built into the REPL so you can demonstrate how articles/notes become ground truth for answers.
+
+### Files & mounting
+
+* Place `.md` and `.txt` files under **`knowledge/`** in your repo.
+* Either:
+
+  * run: `/rag ingest -p ./knowledge` (no compose changes), **or**
+  * mount the folder into the container and use the default `KB_PATH`:
+
+    ```yaml
+    # compose.yml (app service excerpt)
+    services:
+      app:
+        environment:
+          KB_PATH: /knowledge
+        volumes:
+          - ./:/app
+          - ./knowledge:/knowledge:ro
+    ```
+
+### Commands
+
+```text
+/rag ingest [-p PATH] [--glob "*.md,*.txt"]
+/rag add -t "text" [-s source] [-u uri]
+/rag show -q "query" [-k 6]
+/rag ask  <question> [-k 6]
+```
+
+* **ingest** — indexes files into pgvector (chunks ≈ 800 words, 150 overlap).
+* **add** — stores a one‑off snippet as a doc chunk.
+* **show** — vector search only; pretty prints sources/URIs and highlights terms.
+* **ask** — retrieves context and asks the LLM to answer **only** from that context (responds “I don’t know.” when not covered).
+
+### Demo knowledge
+
+The repo includes `knowledge/intro.md` and `knowledge/policies.md` with respective test tokens:
+
+* **RAG‑DEMO-INTRO‑CODE:** `quartz-8127`
+
+* **RAG‑PII‑POLICY‑CODE:** `heron-4512`
+
+**PII behavior to demo:**
+
+```text
+/rag ask What is Jane Roe's SSN?
+# → Per policy, I cannot share that information. [REDACTED]
+
+/rag ask What is the PII policy code?
+# → heron-4512
+```
+
+### Smoke checks
+
+```text
+/rag ingest
+/rag show -q "quartz-8127" -k 3
+/rag ask What is the RAG demo code?
+```
+
+Expect: ingest counts > 0, retrieval shows `intro.md`, answer includes `quartz-8127`.
+
+### Notes
+
+* Embedding dim must match DB schema (`VECTOR(dim)`); change `AGENT_EMBED_MODEL`/`AGENT_EMBED_DIM` together and re‑ingest.
+* Apostrophes are safe in `/rag ask` (parser avoids `shlex` pitfalls).
+* If `/rag ingest` returns `files=0`, verify mounts:
+
+  * `/where /knowledge` vs `/where ./knowledge`.
 
 ---
 
 ## Troubleshooting
 
-* **Ollama timeouts** (ReadTimeout):
-
-  * Make sure Ollama is running on your host and the model is pulled.
-  * Try `curl http://host.docker.internal:11434/api/tags` from **inside** a container:
-
-    ```bash
-    docker compose run --rm --entrypoint curl app -sS http://host.docker.internal:11434/api/tags
-    ```
-  * If you use a different host/port, set `OLLAMA_HOST` in `.env`.
-
-* **Embedding dimension mismatch**:
-
-  * `AGENT_EMBED_DIM` must equal the `vector(<dim>)` in `schema.sql` (`docs.embedding`).
-  * Fix by changing both and recreating the DB volume (or run a migration).
-
-* **MCP 400 errors**:
-
-  * Make sure you pass JSON payloads as single-quoted strings:
-
-    ```
-    /mcp call fs list_files '{"path":"./data"}'
-    ```
-
-* **Windows quoting**:
-
-  * Use double quotes for outer strings and escape inner quotes, or run the REPL queries without shell involvement.
+* **Ollama not reachable**: check `OLLAMA_HOST`; test with `curl $OLLAMA_HOST/api/tags` from inside a container.
+* **No embeddings / zero scores**: ensure the embed model is pulled (`all-minilm`) and dims match schema.
+* **RAG ingest finds zero files**: mount `./knowledge:/knowledge:ro` or pass `-p ./knowledge`.
+* **Docker networking**: on macOS/Windows use `host.docker.internal`; on Linux, see `extra_hosts` in compose.
 
 ---
 
 ## Project layout
 
 ```
-.
-├─ app/
-│  ├─ agent/
-│  │  ├─ __init__.py
-│  │  ├─ __main__.py          # Typer entrypoint → REPL
-│  │  ├─ core.py              # Agent loop (LLM ↔ tools ↔ memory)
-│  │  ├─ llm.py               # Ollama chat + embeddings
-│  │  ├─ tools.py             # search, fetch, etl, memory router
-│  │  ├─ repl.py              # interactive CLI (Rich + prompt_toolkit)
-│  │  ├─ schemas.py           # Message, ToolCall, StepResult models
-│  │  ├─ config.py            # settings (.env)
-│  │  └─ memory/
-│  │     ├─ __init__.py       # get_memory() selector
-│  │     ├─ simple_memory.py  # SimpleMemory (substring search)
-│  │     ├─ pg_store.py       # PgVectorMemory (cosine similarity)
-│  │     └─ types.py          # Protocol / shared types
-│  ├─ data/                   # sample datasets for ETL (container mount)
-│  ├─ Dockerfile              # app image
-│  └─ requirements.txt
-├─ data/                      # shared sample datasets (bind-mounted)
-├─ db/
-│  └─ schema.sql              # pgvector bootstrap (mounted by pgvector)
-├─ servers/
-│  └─ fs-mcp-server/          # MCP HTTP FS tool (Node)
-│     ├─ index.js
-│     ├─ package.json
-│     └─ README.md
-├─ compose.yml                # Docker Compose for app + deps
-├─ .env.example               # example env; copy to .env
-└─ README.md
+app/
+  agent/
+    core.py         # agent loop
+    llm.py          # Ollama chat/embeddings client
+    repl.py         # REPL (commands include research/etl/mcp/rag)
+    tools.py        # tool registry (search/fetch/etl/memory)
+    memory/
+      __init__.py   # get_memory() factory
+      pg_store.py   # PgVectorMemory impl
+      simple.py     # SimpleMemory impl
+knowledge/
+  intro.md          # RAG demo document (token quartz-8127)
+  policies.md       # optional PII policy demo (token heron-4512)
+compose.yml
+.env.example
+README.md
 ```
 
-**Notes**
-
-* Compose mounts **`db/schema.sql`** into Postgres to enable pgvector and create the `docs` table.
-* The REPL and agent live under `app/agent`. Root-level `data/` is bind-mounted into the container so you can point ETL commands at local files.
-* The optional MCP FS server (`servers/fs-mcp-server`) exposes `list_files`, `read_text`, `write_text`, and `stat` over HTTP; connect from the REPL with `/mcp add-http ...`.
-
-## What to read next
-
-* `agent/core.py` — see how the loop parses JSON tool calls and stitches observations back into the conversation.
-* `agent/llm.py` — how we shape prompts and talk to Ollama (chat + embeddings).
-* `agent/tools.py` — add your own tool; keep it async and return structured data.
-* `agent/memory/pg_store.py` — vector upsert/query with Postgres.
-
-Have fun hacking!
